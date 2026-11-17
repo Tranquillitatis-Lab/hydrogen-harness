@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "hydrogen": {
+      "command": "node",
+      "args": ["dist/entry/mcp-shim.js"],
+      "tools": {
+        "fs_read": { "eager": true },
+        "fs_glob": { "eager": true },
+        "fs_grep": { "eager": true },
+        "fs_patch": { "eager": true },
+        "bash": { "eager": true },
+        "agent_dispatch": { "eager": true },
+        "agent_message": { "eager": true },
+        "todo_write": { "eager": true }
+      }
+    }
+  }
+}

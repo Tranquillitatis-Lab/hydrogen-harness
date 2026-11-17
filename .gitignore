@@ -1,0 +1,9 @@
+node_modules/
+.pnpm-store/
+.hydrogen/
+dist/
+web/dist/
+*.tgz
+*.log
+.DS_Store
+Thumbs.db

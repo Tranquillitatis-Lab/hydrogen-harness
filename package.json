@@ -1,0 +1,48 @@
+{
+  "name": "hydrogen-harness",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc && vite build web",
+    "typecheck": "tsc --noEmit && tsc -p web/tsconfig.json --noEmit",
+    "cli": "node dist/entry/cli.js",
+    "build:web": "vite build web",
+    "pack:npm": "npm run build && npm pack"
+  },
+  "bin": {
+    "hgy": "dist/entry/cli.js",
+    "hydrogen": "dist/entry/cli.js"
+  },
+  "files": [
+    "dist",
+    "web/dist",
+    "plugin",
+    "README.md",
+    "ARCHITECTURE.md"
+  ],
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "lucide-react": "^1.72.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8"
+  }
+}
