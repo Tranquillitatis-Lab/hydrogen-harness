@@ -4,8 +4,9 @@ import {
   closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync,
   realpathSync, renameSync, statSync, unlinkSync, writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { pathToFileURL } from "node:url";
 import { LIMITS } from "./protocol.js";
 import type { FsReadInput, FsGlobInput, FsGrepInput, FsPatchInput, ObservedFileRecord, SpillResult } from "./protocol.js";
 import type { OutputSpill } from "./output.js";
@@ -117,8 +118,153 @@ export function normPath(
   return normalized;
 }
 
+export type MediaKind = "image" | "audio" | "video" | "document";
+
+export interface DetectedMedia {
+  mediaKind: MediaKind;
+  mimeType: string;
+}
+
+const MAX_INLINE_MEDIA_BYTES = 20 * 1024 * 1024; // 20 MiB for image/audio/pdf
+const MAX_INLINE_VIDEO_BYTES = 50 * 1024 * 1024; // 50 MiB for video
+
+const EXTENSION_MEDIA_MAP: Record<string, DetectedMedia> = {
+  // Images
+  ".png": { mediaKind: "image", mimeType: "image/png" },
+  ".jpg": { mediaKind: "image", mimeType: "image/jpeg" },
+  ".jpeg": { mediaKind: "image", mimeType: "image/jpeg" },
+  ".webp": { mediaKind: "image", mimeType: "image/webp" },
+  ".gif": { mediaKind: "image", mimeType: "image/gif" },
+  ".heic": { mediaKind: "image", mimeType: "image/heic" },
+  ".heif": { mediaKind: "image", mimeType: "image/heif" },
+  ".bmp": { mediaKind: "image", mimeType: "image/bmp" },
+  ".tif": { mediaKind: "image", mimeType: "image/tiff" },
+  ".tiff": { mediaKind: "image", mimeType: "image/tiff" },
+  // Audio (canonical MIME types expected by Antigravity / Gemini)
+  ".wav": { mediaKind: "audio", mimeType: "audio/wav" },
+  ".wave": { mediaKind: "audio", mimeType: "audio/wav" },
+  ".mp3": { mediaKind: "audio", mimeType: "audio/mp3" },
+  ".ogg": { mediaKind: "audio", mimeType: "audio/ogg" },
+  ".oga": { mediaKind: "audio", mimeType: "audio/ogg" },
+  ".spx": { mediaKind: "audio", mimeType: "audio/ogg" },
+  ".opus": { mediaKind: "audio", mimeType: "audio/opus" },
+  ".flac": { mediaKind: "audio", mimeType: "audio/flac" },
+  ".aac": { mediaKind: "audio", mimeType: "audio/aac" },
+  ".m4a": { mediaKind: "audio", mimeType: "audio/m4a" },
+  ".aif": { mediaKind: "audio", mimeType: "audio/aiff" },
+  ".aiff": { mediaKind: "audio", mimeType: "audio/aiff" },
+  ".aifc": { mediaKind: "audio", mimeType: "audio/aiff" },
+  ".amr": { mediaKind: "audio", mimeType: "audio/amr" },
+  ".weba": { mediaKind: "audio", mimeType: "audio/webm" },
+  ".pcm": { mediaKind: "audio", mimeType: "audio/l16" },
+  ".l16": { mediaKind: "audio", mimeType: "audio/l16" },
+  ".alaw": { mediaKind: "audio", mimeType: "audio/alaw" },
+  ".mulaw": { mediaKind: "audio", mimeType: "audio/mulaw" },
+  ".ulaw": { mediaKind: "audio", mimeType: "audio/mulaw" },
+  // Video
+  ".mp4": { mediaKind: "video", mimeType: "video/mp4" },
+  ".m4v": { mediaKind: "video", mimeType: "video/mp4" },
+  ".webm": { mediaKind: "video", mimeType: "video/webm" },
+  ".mov": { mediaKind: "video", mimeType: "video/mov" },
+  ".qt": { mediaKind: "video", mimeType: "video/mov" },
+  ".mpg": { mediaKind: "video", mimeType: "video/mpeg" },
+  ".mpeg": { mediaKind: "video", mimeType: "video/mpeg" },
+  ".avi": { mediaKind: "video", mimeType: "video/avi" },
+  ".flv": { mediaKind: "video", mimeType: "video/x-flv" },
+  ".wmv": { mediaKind: "video", mimeType: "video/wmv" },
+  ".3gp": { mediaKind: "video", mimeType: "video/3gpp" },
+  ".3gpp": { mediaKind: "video", mimeType: "video/3gpp" },
+  ".ogv": { mediaKind: "video", mimeType: "video/ogg" },
+  // Document
+  ".pdf": { mediaKind: "document", mimeType: "application/pdf" },
+};
+
+export function detectMediaType(filePath: string, bytes: Buffer): DetectedMedia | undefined {
+  const ext = extname(filePath).toLowerCase();
+  // 1. Inspect magic bytes first so mislabeled files (e.g. JPEG saved as .png) get the true MIME type.
+  if (bytes.length >= 8 &&
+      bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 &&
+      bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a) {
+    return { mediaKind: "image", mimeType: "image/png" };
+  }
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return { mediaKind: "image", mimeType: "image/jpeg" };
+  }
+  if (bytes.length >= 6) {
+    const gifSig = bytes.subarray(0, 6).toString("ascii");
+    if (gifSig === "GIF87a" || gifSig === "GIF89a") {
+      return { mediaKind: "image", mimeType: "image/gif" };
+    }
+  }
+  if (bytes.length >= 12) {
+    const fourcc = bytes.subarray(0, 4).toString("ascii");
+    const subType = bytes.subarray(8, 12).toString("ascii");
+    if (fourcc === "RIFF") {
+      if (subType === "WEBP") return { mediaKind: "image", mimeType: "image/webp" };
+      if (subType === "WAVE") return { mediaKind: "audio", mimeType: "audio/wav" };
+      if (subType === "AVI ") return { mediaKind: "video", mimeType: "video/avi" };
+    }
+    if (fourcc === "FORM" && (subType === "AIFF" || subType === "AIFC")) {
+      return { mediaKind: "audio", mimeType: "audio/aiff" };
+    }
+    if (bytes.subarray(4, 8).toString("ascii") === "ftyp") {
+      const brand = subType;
+      if (brand === "heic" || brand === "heix" || brand === "hevc" || brand === "hevx") {
+        return { mediaKind: "image", mimeType: "image/heic" };
+      }
+      if (brand === "mif1" || brand === "msf1") {
+        return { mediaKind: "image", mimeType: ext === ".heic" ? "image/heic" : "image/heif" };
+      }
+      if (brand === "M4A " || brand === "M4B ") {
+        return { mediaKind: "audio", mimeType: "audio/m4a" };
+      }
+      if (brand === "qt  ") {
+        return { mediaKind: "video", mimeType: "video/mov" };
+      }
+      if (brand.startsWith("3gp") || brand === "3g2a") {
+        return { mediaKind: "video", mimeType: "video/3gpp" };
+      }
+      if (ext === ".m4a" || ext === ".aac") {
+        return { mediaKind: "audio", mimeType: "audio/m4a" };
+      }
+      if (ext === ".mov" || ext === ".qt") {
+        return { mediaKind: "video", mimeType: "video/mov" };
+      }
+      return { mediaKind: "video", mimeType: "video/mp4" };
+    }
+  }
+  if (bytes.length >= 4) {
+    const head4 = bytes.subarray(0, 4).toString("ascii");
+    if (head4 === "OggS") {
+      if (ext === ".ogv") return { mediaKind: "video", mimeType: "video/ogg" };
+      if (ext === ".opus") return { mediaKind: "audio", mimeType: "audio/opus" };
+      return { mediaKind: "audio", mimeType: "audio/ogg" };
+    }
+    if (head4 === "fLaC") {
+      return { mediaKind: "audio", mimeType: "audio/flac" };
+    }
+    if ((bytes[0] === 0x49 && bytes[1] === 0x49 && bytes[2] === 0x2a && bytes[3] === 0x00) ||
+        (bytes[0] === 0x4d && bytes[1] === 0x4d && bytes[2] === 0x00 && bytes[3] === 0x2a)) {
+      return { mediaKind: "image", mimeType: "image/tiff" };
+    }
+    if (bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf && bytes[3] === 0xa3) {
+      if (ext === ".weba") return { mediaKind: "audio", mimeType: "audio/webm" };
+      if (ext === ".webm") return { mediaKind: "video", mimeType: "video/webm" };
+    }
+  }
+  if (bytes.length >= 5) {
+    const head5 = bytes.subarray(0, 5).toString("ascii");
+    if (head5 === "%PDF-") return { mediaKind: "document", mimeType: "application/pdf" };
+    if (head5 === "#!AMR") return { mediaKind: "audio", mimeType: "audio/amr" };
+  }
+  if (bytes.length >= 3 && bytes.subarray(0, 3).toString("ascii") === "ID3") {
+    return { mediaKind: "audio", mimeType: "audio/mp3" };
+  }
+  return EXTENSION_MEDIA_MAP[ext];
+}
+
 export function readSnapshot(sessionId: string, absPath: string): {
-  record: ObservedFileRecord; text: string; mode: number;
+  record: ObservedFileRecord; text: string; bytes: Buffer; mode: number;
 } {
   const fd = openSync(absPath, "r");
   try {
@@ -133,7 +279,7 @@ export function readSnapshot(sessionId: string, absPath: string): {
       record: { sessionId, path: absPath, dev: Number(after.dev), ino: Number(after.ino),
         size: Number(after.size), mtimeNs: after.mtimeNs.toString(),
         sha256: createHash("sha256").update(bytes).digest("hex"), observedAt: Date.now() },
-      text: bytes.toString("utf8"), mode: Number(after.mode),
+      text: bytes.toString("utf8"), bytes, mode: Number(after.mode),
     };
   } finally { closeSync(fd); }
 }
@@ -201,11 +347,18 @@ function runRg(cwd: string, args: string[]): Promise<{ stdout: string; exitCode:
     child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
     child.on("error", reject);
     child.on("close", code => {
+      const outStr = Buffer.concat(stdout).toString("utf8");
+      const errStr = Buffer.concat(stderr).toString("utf8");
       if (code === 0 || code === 1) {
-        resolveRg({ stdout: Buffer.concat(stdout).toString("utf8"), exitCode: code });
-      } else {
-        reject(new HydrogenError("INVALID_INPUT", Buffer.concat(stderr).toString("utf8") || `rg exited with ${code}`));
+        resolveRg({ stdout: outStr, exitCode: code });
+        return;
       }
+      const isSyntaxOrFlagError = /regex parse error|error parsing glob|unrecognized|invalid|bad flag|no such file or directory/i.test(errStr) && outStr.length === 0;
+      if (code === 2 && !isSyntaxOrFlagError && (outStr.length > 0 || /permission denied|operation not permitted|interrupted system call|os error/i.test(errStr))) {
+        resolveRg({ stdout: outStr, exitCode: outStr.length > 0 ? 0 : 1 });
+        return;
+      }
+      reject(new HydrogenError("INVALID_INPUT", errStr || `rg exited with ${code}`));
     });
   });
 }
@@ -265,7 +418,10 @@ function searchTarget(projectRoot: string, path?: string): {
     inside(join(realRoot, ".hydrogen", "spill"), target) ||
     inside(join(realRoot, ".hydrogen", "shadow"), target)
   );
-  const args = ["--hidden", "--glob", "!.git/**", ...(spillOrShadow ? [] : ["--glob", "!.hydrogen/**"])];
+  let realHome = "";
+  try { realHome = realpathSync(homedir()); } catch { realHome = resolve(homedir()); }
+  const homeExcludes = target === realHome ? ["--glob", "!Library/**", "--glob", "!.Trash/**"] : [];
+  const args = ["--hidden", "--glob", "!.git/**", ...(spillOrShadow ? [] : ["--glob", "!.hydrogen/**"]), ...homeExcludes];
   return {
     cwd: realRoot,
     rgTarget: inProject ? (relative(realRoot, target) || ".") : target,
@@ -610,8 +766,55 @@ export async function fsRead(
   const realRoot = realpathSync(resolve(projectRoot));
   const displayPath = inside(realRoot, absPath) ? relative(realRoot, absPath) : absPath;
 
+  const media = detectMediaType(absPath, snapshot.bytes);
+  if (media) {
+    if (snapshot.bytes.length === 0) {
+      return {
+        path: displayPath,
+        absPath,
+        fileUri: pathToFileURL(absPath).href,
+        mediaKind: media.mediaKind,
+        mimeType: media.mimeType,
+        startLine: 1,
+        endLine: 0,
+        totalLines: 0,
+        content: `[empty media file (${media.mimeType})]`,
+        inlineText: `[empty media file (${media.mimeType})]`,
+        truncated: false,
+        totalBytes: 0,
+        sha256: snapshot.record.sha256,
+      };
+    }
+    const maxBytes = media.mediaKind === "video" ? MAX_INLINE_VIDEO_BYTES : MAX_INLINE_MEDIA_BYTES;
+    if (snapshot.bytes.length > maxBytes) {
+      const limitMb = Math.round(maxBytes / (1024 * 1024));
+      const actualMb = (snapshot.bytes.length / (1024 * 1024)).toFixed(2);
+      throw new HydrogenError(
+        "INVALID_INPUT",
+        `Media file ${displayPath} (${media.mimeType}, ${actualMb} MiB) exceeds inline limit (${limitMb} MiB). Downsample or trim it first.`,
+      );
+    }
+    const summary = `[media: ${media.mediaKind} (${media.mimeType}) | ${snapshot.bytes.length} bytes]`;
+    return {
+      path: displayPath,
+      absPath,
+      fileUri: pathToFileURL(absPath).href,
+      mediaKind: media.mediaKind,
+      mimeType: media.mimeType,
+      base64Data: snapshot.bytes.toString("base64"),
+      startLine: 1,
+      endLine: 1,
+      totalLines: 1,
+      content: summary,
+      inlineText: summary,
+      truncated: false,
+      totalBytes: snapshot.bytes.length,
+      sha256: snapshot.record.sha256,
+    };
+  }
+
   const startLine = input.startLine ?? 1;
-  const endLine = input.endLine ?? startLine + 799;
+  const endLine = input.endLine ?? startLine + 499;
   if (!Number.isInteger(startLine) || !Number.isInteger(endLine) || startLine < 1 || endLine < startLine) {
     throw new HydrogenError("INVALID_INPUT", "Invalid line range");
   }

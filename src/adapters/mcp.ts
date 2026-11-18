@@ -63,9 +63,15 @@ export function formatToolResult(method: DaemonMethod, result: unknown): string 
     case "tool.fsRead": {
       const r = result as {
         path?: string;
+        absPath?: string;
+        fileUri?: string;
+        mediaKind?: string;
+        mimeType?: string;
+        base64Data?: string;
         startLine?: number;
         endLine?: number;
         totalLines?: number;
+        totalBytes?: number;
         sha256?: string;
         truncated?: boolean;
         outputRef?: string;
@@ -73,6 +79,9 @@ export function formatToolResult(method: DaemonMethod, result: unknown): string 
         inlineText?: string;
       };
       const sha = r.sha256 ? String(r.sha256).slice(0, 12) : "";
+      if (r.mimeType && r.base64Data) {
+        return `[file: ${r.path ?? ""} | media: ${r.mediaKind ?? "binary"} (${r.mimeType}) | bytes: ${r.totalBytes ?? 0} | sha256: ${sha}]`;
+      }
       const body = r.content ?? r.inlineText ?? "";
       return `[file: ${r.path ?? ""} | lines: ${r.startLine ?? 1}-${r.endLine ?? 0} of ${r.totalLines ?? 0} | sha256: ${sha}${
         r.truncated ? ` | shadow: ${r.outputRef}` : ""
@@ -261,6 +270,43 @@ export function formatToolResult(method: DaemonMethod, result: unknown): string 
   }
 }
 
+export function buildToolContentBlocks(method: DaemonMethod, result: unknown): CallToolResult["content"] {
+  const text = formatToolResult(method, result);
+  if (method === "tool.fsRead" && result && typeof result === "object") {
+    const r = result as {
+      path?: string;
+      absPath?: string;
+      fileUri?: string;
+      mediaKind?: string;
+      mimeType?: string;
+      base64Data?: string;
+    };
+    if (typeof r.mimeType === "string" && r.mimeType && typeof r.base64Data === "string" && r.base64Data) {
+      if (r.mediaKind === "image" || r.mimeType.startsWith("image/")) {
+        return [
+          { type: "text", text },
+          { type: "image", data: r.base64Data, mimeType: r.mimeType },
+        ];
+      }
+      // Audio, video, and PDF files are delivered as binary EmbeddedResource blobs,
+      // which Antigravity's `mcpcore.parseCallToolResult` converts into native `codeium_common_pb.Media`.
+      const uri = r.fileUri || (r.absPath ? `file://${r.absPath}` : `file:///${r.path ?? "media"}`);
+      return [
+        { type: "text", text },
+        {
+          type: "resource",
+          resource: {
+            uri,
+            mimeType: r.mimeType,
+            blob: r.base64Data,
+          },
+        },
+      ];
+    }
+  }
+  return [{ type: "text", text }];
+}
+
 export function createMcpServer(
   client: Pick<IpcClient, "call">,
   role: SessionRole = process.env.HYDROGEN_ROLE === "readonly" ? "readonly" : "writer",
@@ -279,8 +325,7 @@ export function createMcpServer(
   const forward = async (method: DaemonMethod, params: unknown): Promise<CallToolResult> => {
     try {
       const result = await client.call(method, params);
-      const text = formatToolResult(method, result);
-      return { content: [{ type: "text", text }] };
+      return { content: buildToolContentBlocks(method, result) };
     } catch (error) {
       return {
         isError: true,
@@ -291,7 +336,7 @@ export function createMcpServer(
 
   if (canRegister("fs_read")) {
     server.registerTool("fs_read", {
-      description: "Read numbered lines (up to 800 lines by default) from any project or local file path and record its snapshot.",
+      description: "Read numbered lines (up to 500 lines by default) or media from any project or local file path.",
       inputSchema: z.object({
         path: z.string(),
         startLine: z.number().int().optional(),
@@ -346,7 +391,7 @@ export function createMcpServer(
 
   if (canRegister("bash")) {
     server.registerTool("bash", {
-      description: "Execute a shell command (default action='exec', waits up to 300s or returns immediately with background: true), send stdin, poll output, or kill a managed job.",
+      description: "Execute a shell command in a managed PTY (default action='exec', sync wait default 90s / max 150s, or background: true), send stdin, poll, or kill.",
       inputSchema: z.object({
         action: z.enum(["exec", "stdin", "poll", "kill"]).optional(),
         jobId: z.string().optional(),
@@ -362,7 +407,7 @@ export function createMcpServer(
 
   if (canRegister("agent_dispatch")) {
     server.registerTool("agent_dispatch", {
-      description: "Orchestrate flat Router-Worker subagents (depth=1) with configurable per-agent tools[]. Actions: spawn (default, alias dispatch; supports tasks:[...] batching, tools default ['fs_read','fs_glob','fs_grep','agent_message'], writeScope, worktree:true isolated git worktree, forkTurns='none'|'all', wait), followup (alias send/resume; drains queued mail and transparently warms/resumes idle or hibernated ACP sessions), send_message / broadcast (queue mailbox messages or @all/* broadcast with mid-turn PreInvocation steer for running agents and zero-token queue for idle agents), wait (cursorless waitAll), interrupt, close (auto-cleans alive pty_jobs), list (alias status).",
+      description: "Orchestrate depth-1 subagents. Actions: spawn (default; single prompt or batch tasks:[...], custom tools[], writeScope, worktree, forkTurns='none'|'all', wait), followup (resume/send to agentId), send_message / broadcast, wait, interrupt, close, list.",
       inputSchema: z.object({
         action: z.enum([
           "spawn", "dispatch", "followup", "send", "send_input", "resume",
@@ -370,57 +415,36 @@ export function createMcpServer(
           "wait", "interrupt", "close", "list", "status",
         ]).optional(),
         agentId: z.string().optional(),
-        target: z.string().optional(),
         to: z.union([z.string(), z.array(z.string())]).optional(),
-        agentIds: z.array(z.string()).optional(),
         taskName: z.string().optional(),
         role: z.string().optional(),
         model: z.string().optional(),
         tools: z.array(SUBAGENT_TOOL_ENUM).optional(),
-        disableAgentMessage: z.boolean().optional(),
         writeScope: z.array(z.string()).optional(),
         forkTurns: z.enum(["none", "all"]).optional(),
         worktree: z.boolean().optional(),
-        reuseKey: z.string().optional(),
         prompt: z.string().optional(),
-        packet: z.object({
-          objective: z.string(),
-          relevantFiles: z.array(z.string()).optional(),
-          writeScope: z.array(z.string()).optional(),
-          knownFacts: z.array(z.string()).optional(),
-          constraints: z.array(z.string()).optional(),
-          outputContract: z.string().optional(),
-        }).optional(),
         tasks: z.array(z.object({
           taskName: z.string().optional(),
           role: z.string().optional(),
           model: z.string().optional(),
           tools: z.array(SUBAGENT_TOOL_ENUM).optional(),
-          disableAgentMessage: z.boolean().optional(),
           forkTurns: z.enum(["none", "all"]).optional(),
           worktree: z.boolean().optional(),
-          prompt: z.string().optional(),
-          objective: z.string().optional(),
-          relevantFiles: z.array(z.string()).optional(),
           writeScope: z.array(z.string()).optional(),
-          knownFacts: z.array(z.string()).optional(),
-          constraints: z.array(z.string()).optional(),
-          outputContract: z.string().optional(),
-          reuseKey: z.string().optional(),
-        })).optional(),
+          prompt: z.string().optional(),
+        }).passthrough()).optional(),
         message: z.string().optional(),
-        interrupt: z.boolean().optional(),
         waitAll: z.boolean().optional(),
-        wake: z.enum(["never", "next_turn"]).optional(),
         wait: z.boolean().optional(),
         timeoutMs: z.number().int().optional(),
-      }),
+      }).passthrough(),
     }, args => forward("tool.agentDispatch", args));
   }
 
   if (canRegister("agent_message")) {
     server.registerTool("agent_message", {
-      description: "Send peer-to-peer, multicast, or @all/* broadcast messages between agents (queued without triggering new turns on idle agents, and live-steered mid-turn via PreInvocation on running agents) or read unread mailbox messages.",
+      description: "Send peer-to-peer, multicast, or @all/* broadcast messages between agents, or read unread mailbox messages.",
       inputSchema: z.object({
         action: z.enum(["send", "broadcast", "read"]).optional(),
         to: z.union([z.string(), z.array(z.string())]).optional(),

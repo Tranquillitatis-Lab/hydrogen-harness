@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import type { DaemonMethod, DaemonRequest, DaemonResponse } from "../core/protocol.js";
+import { LIMITS, type DaemonMethod, type DaemonRequest, type DaemonResponse } from "../core/protocol.js";
 
 const HGY_TEMP_DIR = process.platform === "win32" ? tmpdir() : "/tmp";
 export const GLOBAL_DAEMON_META_PATH = join(HGY_TEMP_DIR, "hgy_active_daemon.json");
@@ -238,7 +238,7 @@ export class IpcClient {
   }
 
   private async startAndConnect(): Promise<Socket> {
-    const deadline = Date.now() + 3000;
+    const deadline = Date.now() + 8000;
     const runDirectory = join(this.projectRoot, ".hydrogen/run");
     await mkdir(runDirectory, { recursive: true });
     const lockPath = join(runDirectory, "daemon.spawn.lock");
@@ -275,7 +275,7 @@ export class IpcClient {
         }
         await delay(Math.min(50, Math.max(0, deadline - Date.now())));
       }
-      throw new Error("Daemon socket was not ready within 3000ms");
+      throw new Error("Daemon socket was not ready within 8000ms");
     } finally {
       if (lock) {
         await lock.close();
@@ -285,9 +285,13 @@ export class IpcClient {
   }
 
   async call<T = unknown>(method: DaemonMethod, params: unknown): Promise<T> {
-    let timeoutMs = this.opts.timeoutMs ?? 120_000;
-    if (typeof params === "object" && params !== null && "timeoutMs" in params && typeof params.timeoutMs === "number") {
-      timeoutMs = Math.max(timeoutMs, params.timeoutMs + 15_000);
+    let timeoutMs = this.opts.timeoutMs ?? (LIMITS.MAX_YIELD_MS + 15_000);
+    if (typeof params === "object" && params !== null) {
+      const p = params as { timeoutMs?: unknown; yieldMs?: unknown };
+      const requested = typeof p.timeoutMs === "number" ? p.timeoutMs : (typeof p.yieldMs === "number" ? p.yieldMs : undefined);
+      if (requested !== undefined && Number.isFinite(requested)) {
+        timeoutMs = Math.max(timeoutMs, Math.min(LIMITS.MAX_YIELD_MS, requested) + 15_000);
+      }
     }
     const request: DaemonRequest = {
       id: randomUUID(), method, identity: identityFromEnv(this.opts.conversationId), params,

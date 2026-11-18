@@ -1,10 +1,12 @@
 /// <reference types="node" />
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { copyFileSync, existsSync, lstatSync, mkdirSync, statSync, symlinkSync } from "node:fs";
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, statSync, symlinkSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { detectMediaType } from "../core/files.js";
 import type {
   ManagedSessionHandle, PromptTurnResult, SessionAdapter, SessionEvent,
   SessionOpenOptions, SessionUsage,
@@ -106,6 +108,56 @@ type Session = {
 
 const DEFAULT_IDLE_GRACE_MS = 3_000;
 
+const MAX_ACP_PROMPT_MEDIA_BYTES = 20 * 1024 * 1024;
+
+/**
+ * Extract local media references (`@path/to/media` or `file:///path/to/media`) from prompt text
+ * so ACP `session/prompt` natively attaches inline `image` blocks and `resource_link` blocks.
+ */
+export function buildAcpPromptBlocks(text: string, cwd: string): ObjectValue[] {
+  const blocks: ObjectValue[] = [{ type: "text", text }];
+  const seenPaths = new Set<string>();
+  const refRegex = /(?:^|[\s(])(?:@([^\s,;()"`'<>]+)|((?:file:\/\/\/)[^\s,;()"`'<>]+))/g;
+  let match: RegExpExecArray | null;
+  while ((match = refRegex.exec(text)) !== null) {
+    const rawRef = match[1] ?? match[2];
+    if (!rawRef) continue;
+    let absPath: string;
+    try {
+      if (rawRef.startsWith("file://")) {
+        absPath = fileURLToPath(rawRef.replace(/#.*$/, ""));
+      } else {
+        const cleaned = rawRef.replace(/#.*$/, "").replace(/:\d+(?:-\d+)?$/, "");
+        absPath = isAbsolute(cleaned) ? resolve(cleaned) : resolve(cwd, cleaned);
+      }
+      if (seenPaths.has(absPath) || !existsSync(absPath)) continue;
+      const st = statSync(absPath);
+      if (!st.isFile() || st.size <= 0 || st.size > MAX_ACP_PROMPT_MEDIA_BYTES) continue;
+      const bytes = readFileSync(absPath);
+      const media = detectMediaType(absPath, bytes);
+      if (!media) continue;
+      seenPaths.add(absPath);
+      if (media.mediaKind === "image") {
+        blocks.push({
+          type: "image",
+          data: bytes.toString("base64"),
+          mimeType: media.mimeType,
+          uri: pathToFileURL(absPath).href,
+        });
+      } else {
+        blocks.push({
+          type: "resource_link",
+          uri: pathToFileURL(absPath).href,
+          name: basename(absPath),
+          mimeType: media.mimeType,
+        });
+      }
+    } catch {
+      /* Ignore invalid or unreadable candidate paths in prompt text. */
+    }
+  }
+  return blocks;
+}
 function object(value: unknown): ObjectValue {
   return value !== null && typeof value === "object" ? value as ObjectValue : {};
 }
@@ -322,7 +374,7 @@ export class AcpSessionAdapter implements SessionAdapter {
       // Register the prompt before observing aborts so cancel follows it on the wire.
       const response = this.request(session.host, "session/prompt", {
         sessionId: session.handle.conversationId,
-        prompt: [{ type: "text", text }],
+        prompt: buildAcpPromptBlocks(text, session.opts.cwd),
       });
       signal?.addEventListener("abort", abort, { once: true });
       if (signal?.aborted) abort();

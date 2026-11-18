@@ -2,11 +2,11 @@
 
 Use the 8 Eager native Hydrogen MCP tools (`mcp_hydrogen_*`) directly; independent calls can run in parallel in a single step:
 
-- `mcp_hydrogen_fs_read` (`path`, `startLine?`, `endLine?`): Read numbered lines (project or external absolute paths) and record an observation snapshot.
+- `mcp_hydrogen_fs_read` (`path`, `startLine?`, `endLine?`): Read numbered lines (default up to 500 lines; project or external absolute paths), or natively load multimodal media files (images, audio, video, PDF), and record an observation snapshot.
 - `mcp_hydrogen_fs_glob` (`pattern`, `path?`, `limit?`): Match file paths by glob pattern.
 - `mcp_hydrogen_fs_grep` (`pattern`, `path?`, `glob?`, `mode?`, `context?`, `limit?`): Regex search (`mode`: `"files" | "content" | "count"`).
 - `mcp_hydrogen_fs_patch` (`path`, `op`, `hunks?`, `content?`, `startLine?`, `endLine?`): Per-file concurrent edits supporting `op: "patch"`, `"write"`, `"create"`, and `"delete"`.
-- `mcp_hydrogen_bash` (`action?`, `command?`, `jobId?`, `input?`, `cwd?`, `yieldMs?`, `timeoutMs?`, `background?`): Managed stateful PTY execution (default `action: "exec"`, sync wait up to 300s, `background: true` for long-running jobs, plus `stdin`/`poll`/`kill`).
+- `mcp_hydrogen_bash` (`action?`, `command?`, `jobId?`, `input?`, `cwd?`, `yieldMs?`, `timeoutMs?`, `background?`): Managed stateful PTY execution (default `action: "exec"`, sync wait default 90s / up to 150s, `background: true` for long-running jobs, plus `stdin`/`poll`/`kill`).
 - `mcp_hydrogen_agent_dispatch`: Flat Router-Worker (`MAX_AGENT_DEPTH=1`) subagent orchestrator:
   - `spawn` (default, alias `dispatch`): Start one or batch `tasks: [...]` workers with custom `tools: [...]` (`"fs_read" | "fs_glob" | "fs_grep" | "fs_patch" | "bash" | "agent_message" | "todo_write"`, default `["fs_read", "fs_glob", "fs_grep", "agent_message"]`; `"agent_message"` is retained unless `disableAgentMessage: true`), optional `writeScope`, `worktree: true` (isolated git worktree under `<projectRoot>/.hydrogen/worktrees/<agentId>` with isolated `cwd` and `writeScope`), `forkTurns: "none" | "all"` (inherits parent model when `"all"`), and `wait: false` async mode.
   - `followup` (aliases `send` / `resume`): Send follow-up instructions to a live or hibernated subagent (draining any queued mailbox messages), reusing warm ACP sessions or transparently resuming cold-hibernated ones on demand.

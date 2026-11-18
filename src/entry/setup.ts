@@ -39,12 +39,12 @@ tools: []
 
 ## 1. 8 个顶层工具原语
 
-- \`mcp_hydrogen_fs_read\` (\`path\`, \`startLine?\`, \`endLine?\`)：按行读取项目内或本地绝对路径文件（默认最多 800 行）并记录版本观察快照。
+- \`mcp_hydrogen_fs_read\` (\`path\`, \`startLine?\`, \`endLine?\`)：按行读取项目内或本地绝对路径文本文件（默认最多 500 行），或原生加载多模态媒体文件（图片、音频、视频、PDF）供模型直接感知，并记录版本观察快照。
 - \`mcp_hydrogen_fs_glob\` (\`pattern\`, \`path?\`, \`limit?\`)：按 glob 模式匹配文件路径（支持项目内及外部绝对路径）。
 - \`mcp_hydrogen_fs_grep\` (\`pattern\`, \`path?\`, \`glob?\`, \`mode?\`, \`context?\`, \`limit?\`)：正则检索文件内容（\`mode\`: \`"files" | "content" | "count"\`）。
 - \`mcp_hydrogen_fs_patch\` (\`path\`, \`op\`, \`hunks?\`, \`content?\`, \`startLine?\`, \`endLine?\`)：并发安全的文件修改工具，支持 \`op: "patch"\`（精准 \`hunks\` 替换）、\`"write"\` / \`"create"\`（全量写入或新建）与 \`"delete"\`。
-- \`mcp_hydrogen_bash\` (\`action?\`, \`command?\`, \`jobId?\`, \`input?\`, \`cwd?\`, \`yieldMs?\`, \`timeoutMs?\`, \`background?\`)：有状态命令执行（默认 \`action: "exec"\`，支持 \`stdin\` / \`poll\` / \`kill\`，同步等待最高 \`300s\`，\`background: true\` 后台运行）。
-- \`mcp_hydrogen_agent_dispatch\` (\`action?\`, \`target?\`/\`agentId?\`, \`to?\`, \`agentIds?\`, \`taskName?\`, \`role?\`, \`model?\`, \`tools?\`, \`disableAgentMessage?\`, \`writeScope?\`, \`worktree?\`, \`forkTurns?\`, \`tasks?\`, \`prompt?\`, \`message?\`, \`wait?\`, \`waitAll?\`, \`interrupt?\`, \`timeoutMs?\`)：单层扁平 Router-Worker 子 Agent 调度器（\`MAX_AGENT_DEPTH=1\`）：
+- \`mcp_hydrogen_bash\` (\`action?\`, \`command?\`, \`jobId?\`, \`input?\`, \`cwd?\`, \`yieldMs?\`, \`timeoutMs?\`, \`background?\`)：有状态命令执行（默认 \`action: "exec"\`，支持 \`stdin\` / \`poll\` / \`kill\`，同步等待默认 \`90s\`、最高 \`150s\`，\`background: true\` 后台运行）。
+- \`mcp_hydrogen_agent_dispatch\` (\`action?\`, \`agentId?\`, \`to?\`, \`taskName?\`, \`role?\`, \`model?\`, \`tools?\`, \`writeScope?\`, \`worktree?\`, \`forkTurns?\`, \`tasks?\`, \`prompt?\`, \`message?\`, \`wait?\`, \`waitAll?\`, \`timeoutMs?\`)：单层扁平 Router-Worker 子 Agent 调度器（\`MAX_AGENT_DEPTH=1\`）：
   - \`spawn\`（默认，兼容 \`dispatch\`）：创建并执行子 Agent。支持通过 \`tools: [...]\` 自定义子 Agent 工具子集（可选 \`"fs_read" | "fs_glob" | "fs_grep" | "fs_patch" | "bash" | "agent_message" | "todo_write"\`，默认 \`["fs_read", "fs_glob", "fs_grep", "agent_message"]\`；除非 \`disableAgentMessage: true\`，默认保留 \`"agent_message"\`）、\`writeScope\` 写范围限制、\`worktree: true\` 创建独立 Git 工作树、\`forkTurns: "none" | "all"\`（\`"all"\` 继承主控上下文与模型以保持 Prefix Cache）、\`tasks: [...]\` 单步批量并行与 \`wait: false\` 后台模式。
   - \`followup\`（兼容 \`send\` / \`resume\`）：向已有 \`agentId\`/\`target\` 发送后续指令（同时排空信箱积压消息），优先复用温热 ACP 会话与 KV Cache；自动休眠的子 Agent 会在调用时按需透明热恢复。
   - \`send_message\` / \`broadcast\`：向指定目标、目标数组或 \`@all\`/\`*\` 发送信箱消息（对 \`idle\` 子 Agent 仅入队不空跑，对运行中子 Agent 通过 \`PreInvocation\` 实时盘中注入）。
