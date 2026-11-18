@@ -1,6 +1,6 @@
-# Hydrogen Harness (`hgy`) 架构复盘、底层逆向档案与重构规划
+# Hydrogen Harness (`hgy`) 架构档案、底层逆向基线与兼容性说明
 
-> **文档目的**：沉淀目前已验证成功的 **“`agy` 非反代去壳与原生 TUI 接管方案”**，客观剖析 `hgy` **现有内部 Harness 架构与设计原则的病灶**，并为下一阶段的新会话重构提供完整上下文基线。
+> **文档目的**：沉淀已验证落地的 **“`agy` 非反代去壳与原生 TUI 接管方案”**、前缀缓存友好的 **SQLite 原位 Live Compact** 与 **扁平三角色子 Agent 调度架构**，并记录针对官方 `agy 1.5.9 – 1.5.11` 的兼容性基线与后续演进方向。
 
 ---
 
@@ -8,7 +8,7 @@
 
 ### 1. 为什么 `hgy` 不是反代（Reverse Proxy），却能彻底替换 `agy` 的工具集与提示词？
 
-- **不触碰红线**：所有网络请求（`daily-cloudcode-pa.googleapis.com`）、OAuth 凭证刷新、TLS 指纹、gRPC/Protobuf 序列化以及二进制签名，100% 由官方原版 `~/.local/bin/agy`（当前测试版本 `v1.2.15`）直接执行，无任何中间人抓包、流量篡改或二进制 Patch。
+- **不触碰红线**：所有网络请求（`daily-cloudcode-pa.googleapis.com`）、OAuth 凭证刷新、TLS 指纹、gRPC/Protobuf 序列化以及二进制签名，100% 由官方原版 `~/.local/bin/agy`（已测试兼容 `v1.5.9` – `v1.5.11`）直接执行，无任何中间人抓包、流量篡改或二进制 Patch。
 - **三大官方扩展接口组合接管**：
   1. **Custom Agent 装配面（`~/.gemini/config/agents/hgy-shell.md`）**：
      - 经反汇编 `agy` 的 `customizations.ParseAgentScriptItemFromMarkdown`（地址 `0x101767850`），`AgentFrontmatter`（结构体定义于 `0x10a8666f0`）支持 19 个 YAML 字段：`name`、`description`、`disabled`、`tools` (`*[]string`)、`excludeDefaultComponents` (`*bool`)、`mainAgent`、`subagent`、`hidden`、`inheritCustomizations`、`inheritMcp`、`model`、`commandExecutionPolicy`、`mcpServers`、`skills`、`preloadSkills`、`plugins`、`rules`、`agents`、`hooks`。
@@ -24,7 +24,7 @@
 
 ---
 
-### 2. `agy` 内部 Compact 机制的逆向真相（为什么以前在 150k~250k 变傻，为什么现在能稳跑 300k）
+### 2. `agy` 内部 Compact 机制的逆向真相（为什么以前在 150k~250k 变傻，为什么现在能稳跑 260k）
 
 通过对 `agy` 二进制反汇编与 `transcript.jsonl` 实测，确认 `agy` 内部存在**两套截断机制**：
 
@@ -39,7 +39,7 @@
    - 经核查 `transcript.jsonl`（step 268–276），当前云端实验的 `CHECKPOINT` 触发线在 **`input_tokens + cache_read_tokens ≈ 500,000 tokens`**（实测在 `500,946 -> 523,355` tokens 时触发 `<CONTEXT_SUMMARY>`）。
    - **破解方式**：
      - 云端推理 API 本身**不会**暗中截断上下文；触发 `<CONTEXT_SUMMARY>` 的执行器就在本地 `agy` 进程内。
-     - 只要 `hgy` 从 `transcript.jsonl` 实时读取真实的 **`input_tokens + cache_read_tokens`**（注意：在 Gemini API 记录中，`input_tokens` 仅代表未命中的尾部增量 token，`cache_read_tokens` 才是缓存前缀 token，两者之和才是真实上下文长度），并在 **300,000 tokens（300k）** 主动执行 `hgy` 自己的 Compact，就**永远不会撞上 `agy` 500k 的劣质 `<CONTEXT_SUMMARY>`**。
+     - 只要 `hgy` 从 `transcript.jsonl` 实时读取真实的 **`input_tokens + cache_read_tokens`**（注意：在 Gemini API 记录中，`input_tokens` 仅代表未命中的尾部增量 token，`cache_read_tokens` 才是缓存前缀 token，两者之和才是真实上下文长度），并在 **260,000 tokens（260k）** 主动执行 `hgy` 自己的 Live Compact，就**永远不会撞上 `agy` 500k 的劣质 `<CONTEXT_SUMMARY>`**。
 
 ---
 
@@ -57,7 +57,8 @@
 | :--- | :--- |
 | `~/AGENTS.md` | 本机共用规则：固化 Homebrew、Conda、Node v24.15.0、uv Python、TeX、`~/.local/bin` 及 18 个预置 Conda 环境路径 |
 | `~/.gemini/config/AGENTS.md` | `agy` 运行与调度规则：无状态命令合并、长输出重定向、防 Compact 原则、Argon/Hydrogen 子 Agent 调度规则 |
-| `~/.gemini/config/agents/hgy-shell.md` | `hgy` 专用零内置工具壳 Agent（`excludeDefaultComponents: true`, `tools: []`, `inheritMcp: true`, `inheritCustomizations: true`） |
+| `~/.gemini/config/agents/hgy-shell.md` | `hgy` 专用零内置工具主控壳 Agent（`excludeDefaultComponents: true`, `tools: []`, `inheritMcp: true`, `inheritCustomizations: false`） |
+| `~/.gemini/config/agents/hgy-subagent.md` | `hgy` 专用 100% 静态子 Agent 壳（`excludeDefaultComponents: true`, `tools: []`, `inheritMcp: true`, `inheritCustomizations: false`, `subagent: true`） |
 | `~/.gemini/config/agents/lean.md` | 普通 `agy` 可选精简主控 Agent |
 | `~/.gemini/config/mcp_config.json` | 挂载 `hydrogen` MCP Server（`dist/entry/mcp-shim.js`） |
 | `~/.gemini/config/hooks.json` | 挂载生命周期钩子（`dist/entry/hook-cli.js`，带进程树校验，普通 `agy` 自动放行） |
@@ -93,4 +94,20 @@
   - `hgy-shell.md` 与 `hgy-subagent.md` 均设置 `inheritCustomizations: false`，彻底隔绝 `~/.gemini/config/AGENTS.md` 中原生 `agy` 工具指令的跨壳污染。
   - 子 Agent 动态契约（`agentId`、`role`、`writeScope`、`worktree`）统一置于首轮用户消息 `[SUBAGENT_CONTRACT]` 头部，保证 `hgy-subagent` 系统提示词跨任务 100% 字节静态一致。
   - 主会话 `mainAgyTurns` 与子任务池 `agyTurns`（容量 4）信号量解耦，支持单步 4 路子 Agent 满并发扇出。
+
+---
+
+## 三、`agy 1.5.10` / `1.5.11` 兼容性基线与演进边界
+
+经对 `agy 1.5.11` 二进制、运行日志及实时生成的 `conversations/<id>.db` 与 `transcript.jsonl` 核验，`1.5.11` 为 `1.5.10` 之上的静默热修构建（无独立 changelog 条目），核心接管面与 `hgy` 当前规划均保持有效：
+
+1. **核心去壳与数据结构 100% 兼容**：
+   - `CustomAgentConfig`（`excludeDefaultComponents` / `inheritCustomizations` / `inheritMcp` / `tools`）、`steps` 表结构、`step_type`（`14`/`15`/`132`）、`MCP_TOOL` 的 `field 140 -> field 2 -> field 1` 正文路径、`PLANNER_RESPONSE` 的 `field 20`、Hooks（`SessionStart`/`PreInvocation`/`PreToolUse`/`Stop`）、`ACP` 与 `transcript.jsonl` 格式均未发生破坏性变动。
+   - 原生 `StepCompactionConfig`（`CLEARED` 机械清理）与云端实验参数 `checkpoint-variant` 在 `1.5.11` 仍存在，去壳与 Live Compact 底座仍为刚需。
+2. **`1.5.10+` 内存分页机制强化了“离线改库”铁律**：
+   - `agy 1.5.10` 起仅在内存中常驻近期步骤、旧步骤按需从磁盘 SQLite 重载。因此 `hgy` 必须严格维持**先停宿主再原位改库再重载**的离线切片流程（ACP 走 `closeAndFlushHost -> 改 DB -> session/load`；TUI 走 `Stop` 钩子退出子进程 -> 改 DB -> `--conversation` 重拉），**严禁在宿主进程存活时热改 `.db`**。
+3. **正向收益与后续规划**：
+   - `1.5.10` 修复了 `agy acp` 取消/关闭会话后的子 Agent 与后台任务残留问题，并将高 Effort 无输出思考超时放宽至 `10 分钟`、限流重试放宽至 `4 分钟`，直接利好 `hgy` 的 4 路子 Agent 并发与长任务运行。
+   - `1.5.10` 收紧的内置终端沙箱（屏蔽 `~/.config` 与 `~/.git-credentials`）仅作用于原生沙箱，不影响走 Node `ProcessManager` PTY 的 `bash` 工具。
+   - 后续演进重点保持不变：围绕 `agent_dispatch` 与子 Agent 上下文/返回契约持续调优，提升复杂长程任务的并行吞吐与缓存命中率。
 
