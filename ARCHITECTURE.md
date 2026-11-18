@@ -57,7 +57,7 @@
 | :--- | :--- |
 | `~/AGENTS.md` | 本机共用规则：固化 Homebrew、Conda、Node v24.15.0、uv Python、TeX、`~/.local/bin` 及 18 个预置 Conda 环境路径 |
 | `~/.gemini/config/AGENTS.md` | `agy` 运行与调度规则：无状态命令合并、长输出重定向、防 Compact 原则、Argon/Hydrogen 子 Agent 调度规则 |
-| `~/.gemini/config/agents/hgy-shell.md` | `hgy` 专用零内置工具主控壳 Agent（`excludeDefaultComponents: true`, `tools: []`, `inheritMcp: true`, `inheritCustomizations: false`） |
+| `~/.gemini/config/agents/hgy-shell.md` | `hgy` 专用零内置工具主控壳 Agent（`excludeDefaultComponents: true`, `tools: []`, `inheritMcp: true`, `inheritCustomizations: false`, `hooks: [../hooks.json]`） |
 | `~/.gemini/config/agents/hgy-subagent.md` | `hgy` 专用 100% 静态子 Agent 壳（`excludeDefaultComponents: true`, `tools: []`, `inheritMcp: true`, `inheritCustomizations: false`, `subagent: true`） |
 | `~/.gemini/config/agents/lean.md` | 普通 `agy` 可选精简主控 Agent |
 | `~/.gemini/config/mcp_config.json` | 挂载 `hydrogen` MCP Server（`dist/entry/mcp-shim.js`） |
@@ -91,7 +91,7 @@
   - `verifier`：独立验收者（只读检索 + `bash`，自动锁定 `writeScope: []`），实现编码与验证硬隔离。
 - **显式模型与思考强度控制**：`agent_dispatch` 支持在顶层或每个子任务显式传入 `model`（如 `hydrogen`、`carbon`、`argon`、`flash`、`opus`、`sonnet`、`inherit`）与 `effort`（`low | medium | high | xhigh`），默认设定为 `model: "hydrogen"` + `effort: "high"`（即 `gemini-4-hydrogen-high`），并自动适配不同模型家族的最高档位。
 - **双壳零污染静态提示词**：
-  - `hgy-shell.md` 与 `hgy-subagent.md` 均设置 `inheritCustomizations: false`，彻底隔绝 `~/.gemini/config/AGENTS.md` 中原生 `agy` 工具指令的跨壳污染。
+  - `hgy-shell.md` 与 `hgy-subagent.md` 均设置 `inheritCustomizations: false`，彻底隔绝 `~/.gemini/config/AGENTS.md` 中原生 `agy` 工具指令的跨壳污染；其中 `hgy-shell.md` 显式挂载 `hooks: [../hooks.json]`，确保 `SessionStart` / `PreInvocation` / `PreToolUse` / `Stop` 钩子与 Native TUI Live Compact 正常触发。
   - 子 Agent 动态契约（`agentId`、`role`、`writeScope`、`worktree`）统一置于首轮用户消息 `[SUBAGENT_CONTRACT]` 头部，保证 `hgy-subagent` 系统提示词跨任务 100% 字节静态一致。
   - 主会话 `mainAgyTurns` 与子任务池 `agyTurns`（容量 4）信号量解耦，支持单步 4 路子 Agent 满并发扇出。
 

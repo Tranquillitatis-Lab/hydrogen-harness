@@ -52,6 +52,8 @@ subagent: false
 excludeDefaultComponents: true
 inheritCustomizations: false
 inheritMcp: true
+hooks:
+  - ../hooks.json
 tools: []
 ---
 
