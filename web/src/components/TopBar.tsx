@@ -23,9 +23,9 @@ export function TopBar({ snapshot, theme, onTheme, onSidebar, onInspector, inspe
       <div className={`meter ${stats.level}`}><div style={{ width: `${Math.min(100, stats.usageRatio * 100)}%` }} /></div>
       <button className="compact-trigger" disabled={blocked} onClick={() => setCompact(!compact)}>Compact<ChevronDown size={12} /></button>
       {compact && <form className="popover compact-popover" onSubmit={event => { event.preventDefault(); void act("compact", { instructions: focus }); setCompact(false); }}>
-        <div className="row between"><strong>Compact context</strong><button type="button" className="icon-button" aria-label="Close compact" onClick={() => setCompact(false)}><X size={14} /></button></div>
-        <p>Carry the important context into the next epoch.</p><input autoFocus value={focus} onChange={event => setFocus(event.target.value)} placeholder="Optional focus or instructions…" aria-label="Compaction focus" />
-        <button className="primary" disabled={blocked}><Check size={14} />Compact & continue</button>
+        <div className="row between"><strong>Live Compact context</strong><button type="button" className="icon-button" aria-label="Close compact" onClick={() => setCompact(false)}><X size={14} /></button></div>
+        <p>Fold completed tool outputs in place while preserving your Prefix Cache.</p><input autoFocus value={focus} onChange={event => setFocus(event.target.value)} placeholder="Optional next-step note…" aria-label="Compaction focus" />
+        <button className="primary" disabled={blocked}><Check size={14} />Compact in place</button>
       </form>}
     </div>
     <div className="topbar-actions"><div className="mode-switch" aria-label="Approval mode">{modes.map(mode => <button key={mode.id} className={snapshot.approvalMode === mode.id ? "selected" : ""} onClick={() => void act("settings", { approvalMode: mode.id })}>{mode.label}</button>)}</div>

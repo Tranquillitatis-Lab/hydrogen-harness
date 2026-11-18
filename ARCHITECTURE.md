@@ -65,62 +65,32 @@
 
 ---
 
-## 二、自我批判：为什么 `hgy` 现有的内部 Harness 架构与设计原则是一团糟？
+## 二、核心机制：缓存命中友好的原位 Live Compact 与扁平子 Agent 编排
 
-虽然我们成功拆掉了 `agy` 的外壳护栏与冗余提示词，但 **`hgy` 目前内部的代码实现（`src/core/*`）沿用了一套过度教条、脱离 LLM 实际工作流的“分布式数据库式”设计原则**，导致模型在实际使用工具时处处受阻。
+### 1. 原位 SQLite Live Compact（`src/core/live-compact.ts`）
 
-### 1. 现有设计原则的四大误区
+针对 `agy` 本地持久化库 `~/.gemini/hydrogen-cli/conversations/<convId>.db`（SQLite 3 `steps` 表，`CortexStep` Protobuf 编码），借鉴 `dsh-live-compact` 的设计纪律实现了零模型调用的原位压缩器：
 
-1. **误区一：把单机 Coding Agent 当成“不可信的拜占庭将军”来防（过度设计的租约、Epoch 与路径沙箱）**
-   - **表现**：设计了复杂的 `epoch`、写租约（`assertWriteLease`）、`STALE_EPOCH` 报错和死板的 `normPath` 项目根目录沙箱（`src/core/files.ts:19-50`）。
-   - **恶果**：
-     - 模型想读一下 `/tmp` 下的日志、`/opt/anaconda3` 下的库代码、或者上级目录的参考文件，`normPath` 直接抛 `PERMISSION_DENIED: Path escapes the project root`。
-     - 一旦发生 Epoch 切换，旧 `sessionId` 的文件观察记录、子 Agent、工作流全部因为 `epoch !== activeEpoch` 报 `STALE_EPOCH` 作废。
+1. **只压工具结果正文，不动签名与调用配对**：
+   - `step_type = 15`（`PLANNER_RESPONSE`）内含 Gemini 3/4 强校验的 `thought_signature` 与 `functionCall` 列表；`step_type = 132`（`MCP_TOOL`）的 `field 140 -> field 2 -> field 1` 则承载实际发往大模型的工具输出文本（实测占长会话总上下文 80%+）。
+   - `compactConversationSqlite` 保持全部 `step_type = 14`（用户输入）、`step_type = 15`（模型思考/工具调用签名）及步骤序号 `idx` 100% 原封不动，仅对选中区间内的 `step_type = 132` 输出字段进行原位 Spine 折叠，杜绝 `thoughtSignature` 失效与工具配对断链。
+2. **单调右移地板（Monotonic Floor）保死 Prefix Cache**：
+   - 每次切片在右边界锚点写入 `[SPINE_CHECKPOINT_CARD v1 | cut=...]` 地板标记；后续切片严格限制 `cutStartIdx > floorBefore`，**绝不触碰左侧已缓存前缀的任何一个字节**。
+   - 保留最近 `keepRounds = 3` 个已完成普通工具轮完整原文；若最新轮出现 `>= 24k tokens` 的超大非报错输出，立即触发尾端指针化切片（此时右侧重写尾巴趋近于 0）。
+   - **失败诊断门禁与原子备份**：报错步骤完整保留退出码与诊断行；切片前先将原始输出原子落盘至 `.hydrogen/shadow/cut-*.log`（`0o600` 权限 + SHA256/字节数校验），备份失败则拒绝改库。
+3. **ACP 与原生 TUI 双通道衔接**：
+   - **ACP 模式（`--web` / `--repl` / `-p`）**：通过 `AcpSessionAdapter.closeAndFlushHost` 刷盘并释放 Go 进程内存轨迹缓存后执行毫秒级 SQLite 原位切片，随即 `session/load` 重载同一 `conversationId`，实测云端 `cache_read_tokens` 持续命中前序前缀。
+   - **原生 `agy` TUI 模式**：移除早期 `effectiveTokens = 4000` 假账，实时读取 `transcript.jsonl` 的真实 `input_tokens + cache_read_tokens`；到达 `260k` 水位线（远低于 `agy` 云端实验 `500k` `<CONTEXT_SUMMARY>` 墙）且存在可切轮次时，在 `Stop` 钩子收尾后优雅退出当前子进程、原位压缩 `<convId>.db` 并原地无缝重拉 `agy --conversation <convId>`。
 
-2. **误区二：把 Compact 做成了“强制杀进程重开 + 逼模型手写八股文”（怪异的轮转机制）**
-   - **表现**：`src/core/handover.ts` 要求模型在日常工作中分心去调 `handover_checkpoint` 维护 `{ activeGoal, verifiedFacts, deadEndsTried, nextImmediateStep }`；轮转时直接 `SIGTERM` 杀掉当前进程重启。
-   - **恶果**：
-     - 在 0~300k 上下文完全干净的情况下，逼模型手动填 checkpoint 纯属浪费智商与 token。
-     - 杀进程重启会打断用户的 TUI 视觉连续性，且机械拼接的 JSON `HandoffPacket` 既生硬又缺乏代码上下文细节。
+### 2. 扁平三角色子 Agent 调度与双壳静态提示词（`src/core/agents.ts` / `src/entry/setup.ts`）
 
-3. **误区三：工具输入/输出协议充满“反模型人体工学”的设计（双重 JSON 序列化与糟糕报错）**
-   - **表现**：
-     - **双重 JSON 转义污染（`src/adapters/mcp.ts:12`）**：所有工具返回值都被 `JSON.stringify(result)` 包成单行 JSON 字符串。模型调用 `fs_read` 读代码或调用 `bash` 看输出时，看到的是满屏 `\n`、`\"`、`\\t` 的转义文本，不仅多耗 15%~20% token，还极易导致后续写 `fs_patch` 时数错缩进和转义符。
-     - **`fs_patch` 缺乏全量写模式且报错似谜语（`src/core/files.ts:195-235`）**：
-       - `op: "create"` 用了 `flag: "wx"`，对已存在的文件直接报错 `File already exists`；模型想重写一个 30 行的配置文件时，被迫把旧文件全文塞进 `oldText` 走 `patch`。
-       - `oldText` 匹配失败时只报 `"Each oldText must match exactly once in the current text"`，**不告诉模型是匹配了 0 次还是匹配了多次（也不给行号）**，导致模型盲目重试。
-     - **`fs_read` 空文件与硬截断 Bug（`src/core/files.ts:243-253`）**：空文件 `lines.pop()` 后返回 `startLine: 1, endLine: 0`；且固定一次最多 400 行。
-     - **`bash` 硬编码 30 秒超时导致轮询地狱（`src/core/process.ts:65`）**：`yieldMs = Math.min(30_000, ...)` 将单次命令等待时间锁死在 30 秒以内。跑一个 40 秒的构建或测试就会变成后台 job，迫使模型一轮接一轮地调用 `bash({ action: "poll", jobId })`，每轮 `poll` 都白白重算一遍几十万的上下文 Cache Token！而且 `ProcessManager.start` 没有注入本机标准开发工具链 `PATH`。
+- **三类专职角色（`MAX_AGENT_DEPTH=1`）**：
+  - `explorer`（默认）：纯只读（`fs_read`、`fs_glob`、`fs_grep`），同步任务默认不挂载 `agent_message` 以避免双重汇报空转。
+  - `worker`：有界读写执行者（含 `fs_patch`、`bash`），支持 `writeScope` 文件边界锁或 `worktree: true` 独立 Git 工作树（完成时自动附带 `git status/diff --stat` 摘要）。
+  - `verifier`：独立验收者（只读检索 + `bash`，自动锁定 `writeScope: []`），实现编码与验证硬隔离。
+- **显式模型与思考强度控制**：`agent_dispatch` 支持在顶层或每个子任务显式传入 `model`（如 `hydrogen`、`carbon`、`argon`、`flash`、`opus`、`sonnet`、`inherit`）与 `effort`（`low | medium | high | xhigh`），默认设定为 `model: "hydrogen"` + `effort: "high"`（即 `gemini-4-hydrogen-high`），并自动适配不同模型家族的最高档位。
+- **双壳零污染静态提示词**：
+  - `hgy-shell.md` 与 `hgy-subagent.md` 均设置 `inheritCustomizations: false`，彻底隔绝 `~/.gemini/config/AGENTS.md` 中原生 `agy` 工具指令的跨壳污染。
+  - 子 Agent 动态契约（`agentId`、`role`、`writeScope`、`worktree`）统一置于首轮用户消息 `[SUBAGENT_CONTRACT]` 头部，保证 `hgy-subagent` 系统提示词跨任务 100% 字节静态一致。
+  - 主会话 `mainAgyTurns` 与子任务池 `agyTurns`（容量 4）信号量解耦，支持单步 4 路子 Agent 满并发扇出。
 
-4. **误区四：子 Agent 调度器沦为“残废的只读玩具”（`src/core/agents.ts`）**
-   - **表现**：
-     - 只有 `role: "explorer"` 一种只读角色，连跑个 Python 小脚本或单测验证假设的权限都没有，也无法派发有边界的写任务（Worker）。
-     - 模型不可选（写死主会话模型）。
-     - 异步等待接口 `agent_wait({ afterSeq })` 要求模型传入内部自增事件序号 `afterSeq`，完全违背 LLM 的直觉。
-
----
-
-## 三、下一阶段（新 Session）待讨论与重构的核心议题
-
-在新会话中，我们应当**推倒 `hgy` 内部那套繁琐的“租约/Epoch/沙箱”教条**，重新确立一套真正服务于模型生产力与上下文效率的 Harness 设计原则：
-
-### 议题 1：重新定义 `hgy` 的核心设计原则（建议草案）
-1. **模型人体工学优先（Model Ergonomics First）**：
-   - 工具的输入参数应极其符合直觉，工具的输出必须是**零转义的干净纯文本（Clean Plaintext）**，报错信息必须给出**立即可行动的修正线索**（如匹配行号、相似片段）。
-2. **宽进严出、去沙箱枷锁（Frictionless Read, Guarded Write）**：
-   - 本机任意路径对读/检索工具（`fs_read`、`fs_glob`、`fs_grep`）完全敞开；写操作默认对工作区与 `/tmp` 敞开，用轻量版本校验（防误覆盖外部修改）代替沉重的分布式租约与 Epoch 锁。
-3. **一次调用完结，拒绝轮询刷步数（One-Shot Completion over Polling）**：
-   - 无论是 `bash` 执行命令（支持高达 5~10 分钟同步等待）还是 `agent_dispatch` 并行派发多个子 Agent（支持 `Promise.all` 同步扇出/扇入一步返回），都应尽量在**单次工具调用**内返回完整结论，避免模型为了等结果而空转多轮消耗 Cache Token。
-4. **对模型隐形的无感 Compact（Invisible Compaction）**：
-   - 彻底废除 `handover_checkpoint` 八股文工具与 `STALE_EPOCH` 机制；Compact 完全由 Harness 在 300k 阈值处（或用户手动触发时）自动完成上下文蒸馏与注入。
-
----
-
-### 议题 2：核心代码模块的重写清单（供新会话逐项拍板实施）
-
-| 模块 | 涉及文件 | 计划重写内容 |
-| :--- | :--- | :--- |
-| **1. 文件与搜索工具集** | `src/core/files.ts`<br>`src/adapters/mcp.ts` | • 移除 `normPath` 对只读操作的 `projectRoot` 限制<br>• `fs_read` / `fs_grep` / `fs_glob` 改为纯文本格式化输出（去掉双重 JSON 转义）<br>• `fs_patch` 增加 `op: "write"`（全量覆写/新建）、可选 `startLine`/`endLine` 范围锚定、换行符归一化、以及精确到行号的 0-match / multi-match 诊断报错 |
-| **2. 命令执行器 (`bash`)** | `src/core/process.ts` | • 默认注入 `~/AGENTS.md` 中的完整开发工具链 `PATH`<br>• 同步执行等待上限提升至 `300_000ms`（5 分钟，默认 `120_000ms`），彻底消除 30 秒强制断连轮询<br>• 显式区分同步命令与 `background: true` 后台任务，直接返回干净的 `[exit: 0] + stdout/stderr` 纯文本 |
-| **3. 子 Agent 编排器** | `src/core/agents.ts`<br>`src/core/protocol.ts` | • 支持三类角色：`explorer`（只读检索+只读命令）、`worker`（带 `writeScope` 文件边界锁的并行修改者）、`verifier`（只读源码 + 可跑测试/构建的独立验证者）<br>• 支持 `tasks: [...]` 批量并行派发并默认阻塞汇总返回，砍掉反人类的 `agent_wait(afterSeq)`<br>• 支持按任务指定 `model`（默认 `gemini-4-hydrogen-high`） |
-| **4. 300k Compact 引擎** | `src/core/handover.ts`<br>`src/core/runtime.ts`<br>`src/entry/cli.ts` | • 移除 `handover_checkpoint` 工具与 `STALE_EPOCH` 报错，文件观察与后台任务按 `threadId` 持久绑定<br>• 重新设计 300k Compact 的触发与上下文蒸馏机制（探讨如何在尽量不打断用户体验的前提下完成 300k 上下文压缩） |
