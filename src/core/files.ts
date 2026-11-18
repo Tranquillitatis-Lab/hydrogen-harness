@@ -836,20 +836,61 @@ export async function fsRead(
   const lines = snapshot.text.split(/\r?\n/);
   if (lines[lines.length - 1] === "") lines.pop();
   const actualEnd = Math.min(endLine, lines.length);
-  const slice = lines.slice(startLine - 1, actualEnd).map((line, index) => `${startLine + index}|${line}`).join("\n");
-  const spill = await outputSpill("read", slice, LIMITS.TOOL_INLINE_BYTES, {
+  const rawSliceLines = lines.slice(startLine - 1, actualEnd);
+  let hadLongLine = false;
+  const displaySlice = rawSliceLines.map((line, index) => {
+    if (line.length > LIMITS.FS_READ_MAX_LINE_CHARS) {
+      hadLongLine = true;
+      const kept = line.slice(0, LIMITS.FS_READ_MAX_LINE_CHARS);
+      return `${startLine + index}|${kept} ... [line truncated: ${line.length} chars]`;
+    }
+    return `${startLine + index}|${line}`;
+  }).join("\n");
+
+  if (!hadLongLine) {
+    const spill = await outputSpill("read", displaySlice, LIMITS.FS_READ_INLINE_BYTES, {
+      sessionId,
+      kind: "read",
+      commandOrPath: displayPath,
+    });
+    return {
+      path: displayPath,
+      startLine,
+      endLine: actualEnd,
+      totalLines: lines.length,
+      content: spill.inlineText,
+      ...spill,
+      sha256: snapshot.record.sha256,
+    };
+  }
+
+  // When long minified lines were capped per-line, persist the full unclipped slice to shadow if large
+  // while returning the clean per-line capped text when it fits within FS_READ_INLINE_BYTES.
+  const fullRawSlice = rawSliceLines.map((line, index) => `${startLine + index}|${line}`).join("\n");
+  const fullSpill = await outputSpill("read", fullRawSlice, 0, {
     sessionId,
     kind: "read",
     commandOrPath: displayPath,
   });
+  const boundedSpill = await outputSpill("read", displaySlice, LIMITS.FS_READ_INLINE_BYTES, {
+    sessionId,
+    kind: "read",
+    commandOrPath: displayPath,
+  });
+  const inlineText = boundedSpill.truncated
+    ? boundedSpill.inlineText
+    : `${displaySlice}\n[long lines capped at ${LIMITS.FS_READ_MAX_LINE_CHARS} chars; full slice saved to ${fullSpill.outputRef}]`;
 
   return {
     path: displayPath,
     startLine,
     endLine: actualEnd,
     totalLines: lines.length,
-    content: spill.inlineText,
-    ...spill,
+    content: inlineText,
+    inlineText,
+    truncated: true,
+    totalBytes: fullSpill.totalBytes,
+    outputRef: fullSpill.outputRef,
     sha256: snapshot.record.sha256,
   };
 }

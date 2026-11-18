@@ -21,10 +21,11 @@ export interface ShadowMetaRecord {
   bytes: number;
   lines: number;
   label: string;
-  kind: NonNullable<SpillOptions["kind"]>;
+  kind: NonNullable<SpillOptions["kind"]> | "cut";
   isError: boolean;
   exitCode: number | null;
   commandOrPath?: string;
+  callId?: string;
   createdAt: number;
 }
 
@@ -57,12 +58,92 @@ function countLines(text: string): number {
 function writeFileAtomic(targetPath: string, data: Buffer | string): void {
   const tempPath = `${targetPath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
   try {
-    writeFileSync(tempPath, data);
+    writeFileSync(tempPath, data, { mode: 0o600 });
     renameSync(tempPath, targetPath);
   } catch (error) {
     try { unlinkSync(tempPath); } catch { /* Ignore cleanup error. */ }
     throw error;
   }
+}
+
+export function ensurePrivateShadowDir(projectRoot: string): string {
+  const shadowDir = join(projectRoot, ".hydrogen", "shadow");
+  mkdirSync(shadowDir, { recursive: true, mode: 0o700 });
+  return shadowDir;
+}
+
+export function saveShadowBlob(
+  projectRoot: string,
+  options: {
+    prefix?: "raw" | "cut";
+    idHint?: string;
+    label: string;
+    bytes: Buffer;
+    totalLines: number;
+    kind: ShadowMetaRecord["kind"];
+    isError?: boolean;
+    exitCode?: number | null;
+    commandOrPath?: string;
+    callId?: string;
+    protectedRefs?: Iterable<string>;
+  },
+): { outputRef: string; metaRef: string; sha256: string; totalBytes: number } {
+  const shadowDir = ensurePrivateShadowDir(projectRoot);
+  const totalBytes = options.bytes.length;
+  const sha256 = createHash("sha256").update(options.bytes).digest("hex");
+  const prefix = options.prefix ?? "raw";
+  const stem = options.idHint
+    ? `${prefix}-${options.idHint.replace(/[^a-zA-Z0-9._-]/g, "_")}-${sha256.slice(0, 12)}`
+    : `${prefix}-${sha256.slice(0, 16)}`;
+  const outputRef = join(shadowDir, `${stem}.log`);
+  const metaRef = join(shadowDir, `${stem}.meta.json`);
+
+  const meta: ShadowMetaRecord = {
+    sha256,
+    bytes: totalBytes,
+    lines: options.totalLines,
+    label: options.label,
+    kind: options.kind,
+    isError: Boolean(options.isError),
+    exitCode: options.exitCode ?? null,
+    commandOrPath: options.commandOrPath,
+    callId: options.callId,
+    createdAt: Date.now(),
+  };
+
+  let reused = false;
+  try {
+    const existing = statSync(outputRef);
+    if (existing.isFile() && existing.size === totalBytes) {
+      reused = true;
+      const now = new Date();
+      try { utimesSync(outputRef, now, now); } catch { /* Ignore mtime update error. */ }
+      try {
+        if (existsSync(metaRef)) utimesSync(metaRef, now, now);
+        else writeFileAtomic(metaRef, JSON.stringify(meta));
+      } catch { /* Ignore metadata refresh error. */ }
+    }
+  } catch {
+    /* File does not exist yet. */
+  }
+
+  if (!reused) {
+    writeFileAtomic(outputRef, options.bytes);
+    writeFileAtomic(metaRef, JSON.stringify(meta));
+  }
+
+  const verified = statSync(outputRef);
+  if (!verified.isFile() || verified.size !== totalBytes) {
+    throw new Error(`Shadow backup verification failed for ${outputRef}`);
+  }
+
+  const protectedRefs = new Set<string>([outputRef]);
+  if (options.protectedRefs) {
+    for (const ref of options.protectedRefs) protectedRefs.add(ref);
+  }
+  rotateShadowIfNeeded(shadowDir, protectedRefs);
+
+  return { outputRef, metaRef, sha256, totalBytes };
 }
 
 export function rotateShadowIfNeeded(
@@ -98,7 +179,7 @@ export function rotateShadowIfNeeded(
 
   const fileStats = new Map<string, { size: number; mtimeMs: number }>();
   for (const name of entries) {
-    if (!name.startsWith("raw-") || (!name.endsWith(".log") && !name.endsWith(".meta.json"))) continue;
+    if ((!name.startsWith("raw-") && !name.startsWith("cut-")) || (!name.endsWith(".log") && !name.endsWith(".meta.json"))) continue;
     const fullPath = join(shadowDir, name);
     try {
       const info = statSync(fullPath);
@@ -242,52 +323,18 @@ export function spillOutput(
     return { inlineText: text, truncated: false, totalBytes, sha256 };
   }
 
-  const shadowDir = join(projectRoot, ".hydrogen", "shadow");
-  mkdirSync(shadowDir, { recursive: true });
-
-  const shortHash = sha256.slice(0, 16);
-  const outputRef = join(shadowDir, `raw-${shortHash}.log`);
-  const metaRef = join(shadowDir, `raw-${shortHash}.meta.json`);
   const totalLines = countLines(text);
-
-  const meta: ShadowMetaRecord = {
-    sha256,
-    bytes: totalBytes,
-    lines: totalLines,
+  const { outputRef } = saveShadowBlob(projectRoot, {
+    prefix: "raw",
     label,
+    bytes,
+    totalLines,
     kind: options?.kind ?? "other",
-    isError: Boolean(options?.isError),
-    exitCode: options?.exitCode ?? null,
+    isError: options?.isError,
+    exitCode: options?.exitCode,
     commandOrPath: options?.commandOrPath,
-    createdAt: Date.now(),
-  };
-
-  let reused = false;
-  try {
-    const existing = statSync(outputRef);
-    if (existing.isFile() && existing.size === totalBytes) {
-      reused = true;
-      const now = new Date();
-      try { utimesSync(outputRef, now, now); } catch { /* Ignore mtime update error. */ }
-      try {
-        if (existsSync(metaRef)) utimesSync(metaRef, now, now);
-        else writeFileAtomic(metaRef, JSON.stringify(meta));
-      } catch { /* Ignore metadata refresh error. */ }
-    }
-  } catch {
-    /* File does not exist yet. */
-  }
-
-  if (!reused) {
-    writeFileAtomic(outputRef, bytes);
-    writeFileAtomic(metaRef, JSON.stringify(meta));
-  }
-
-  const protectedRefs = new Set<string>([outputRef]);
-  if (options?.protectedRefs) {
-    for (const ref of options.protectedRefs) protectedRefs.add(ref);
-  }
-  rotateShadowIfNeeded(shadowDir, protectedRefs);
+    protectedRefs: options?.protectedRefs,
+  });
 
   if (isSuccessBash) {
     const card = buildSuccessBashCard(text, totalBytes, totalLines, outputRef);
@@ -327,12 +374,15 @@ export function spillOutput(
   const diagHeaderReserve = 96;
   const diagByteBudget = Math.max(0, maxBytes - headUsedBytes - tailUsedBytes - noticeBytes - diagHeaderReserve);
 
+  const extractDiagnostics = options?.kind === "bash" || options?.kind === "workflow";
   const middleBytes = bytes.subarray(headEnd, tailStart);
-  const diagLines = extractMiddleFailureDiagnostics(
-    middleBytes,
-    LIMITS.SPINE_TOOL_BUDGET_CHARS,
-    diagByteBudget,
-  );
+  const diagLines = extractDiagnostics
+    ? extractMiddleFailureDiagnostics(
+        middleBytes,
+        LIMITS.SPINE_TOOL_BUDGET_CHARS,
+        diagByteBudget,
+      )
+    : [];
 
   const diagSection = diagLines.length > 0
     ? `\n--- [Middle Failure Diagnostics Extracted (${diagLines.length} lines)] ---\n${diagLines.join("\n")}\n`
