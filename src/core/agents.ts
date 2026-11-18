@@ -9,10 +9,13 @@ import {
   ALL_SUBAGENT_TOOLS,
   DEFAULT_SUBAGENT_TOOLS,
   LIMITS,
+  extractEffortFromModelId,
+  resolveModelAndEffort,
   type AgentDispatchInput,
   type AgentMessageInput,
   type AgentTaskSpec,
   type AgentWaitInput,
+  type CanonicalEffort,
   type SessionIdentity,
   type SessionRole,
   type SubagentToolName,
@@ -57,6 +60,7 @@ export class FifoSemaphore {
   }
 }
 
+export const mainAgyTurns = new FifoSemaphore(1);
 export const agyTurns = new FifoSemaphore(LIMITS.MAX_CONCURRENT_AGY_TURNS);
 
 const VALID_TOOL_SET = new Set<string>(ALL_SUBAGENT_TOOLS);
@@ -70,6 +74,7 @@ const ACTIVE_BROADCAST_STATUSES = new Set(["queued", "starting", "opening", "run
 const WAIT_EVENT_TYPES = new Set(["MESSAGE", "BROADCAST", "FINAL_ANSWER", "TURN_COMPLETED", "CLOSED", "agent.completed"]);
 
 export interface SubagentResult extends SubagentRecord {
+  effort?: CanonicalEffort;
   unreadMailCount?: number;
   worktreePath?: string;
 }
@@ -80,6 +85,7 @@ export interface AgentBatchTaskResult {
   nickname: string;
   role: string;
   model: string;
+  effort?: CanonicalEffort;
   tools: SubagentToolName[];
   writeScope?: string[];
   worktreePath?: string;
@@ -124,14 +130,25 @@ function resolveToolsAndRole(
   inputTools?: SubagentToolName[],
   roleLabel?: string,
   requestedScope?: string[],
-  disableAgentMessage = false,
-  forceWriter = false,
+  options?: {
+    disableAgentMessage?: boolean;
+    enableAgentMessage?: boolean;
+    asyncMode?: boolean;
+    forceWriter?: boolean;
+  },
 ): {
   tools: SubagentToolName[];
   sessionRole: SessionRole;
   roleLabel: string;
   writeScope?: string[];
 } {
+  const normalizedRole = roleLabel?.trim().toLowerCase();
+  if (normalizedRole === "prober") {
+    throw new HydrogenError(
+      "INVALID_INPUT",
+      "Role 'prober' is not supported; use role 'explorer', 'worker', or 'verifier'.",
+    );
+  }
   let tools: SubagentToolName[];
   if (inputTools !== undefined) {
     for (const tool of inputTools) {
@@ -140,21 +157,26 @@ function resolveToolsAndRole(
       }
     }
     tools = [...new Set(inputTools)];
-  } else if (roleLabel === "verifier") {
-    tools = ["fs_read", "fs_glob", "fs_grep", "bash", "agent_message"];
-  } else if (roleLabel === "worker" || requestedScope !== undefined || forceWriter) {
-    tools = ["fs_read", "fs_glob", "fs_grep", "fs_patch", "bash", "agent_message"];
+  } else if (normalizedRole === "verifier") {
+    tools = ["fs_read", "fs_glob", "fs_grep", "bash"];
+  } else if (normalizedRole === "worker" || requestedScope !== undefined || options?.forceWriter) {
+    tools = ["fs_read", "fs_glob", "fs_grep", "fs_patch", "bash"];
   } else {
     tools = [...DEFAULT_SUBAGENT_TOOLS];
   }
-  if (disableAgentMessage) {
+
+  const wantAgentMessage = options?.disableAgentMessage
+    ? false
+    : Boolean(options?.enableAgentMessage || options?.asyncMode || inputTools?.includes("agent_message"));
+  if (!wantAgentMessage) {
     tools = tools.filter(t => t !== "agent_message");
   } else if (!tools.includes("agent_message")) {
     tools.push("agent_message");
   }
+
   const sessionRole: SessionRole = tools.includes("fs_patch") || tools.includes("bash") ? "writer" : "readonly";
   const effectiveLabel = roleLabel?.trim() || (sessionRole === "writer" ? "worker" : "explorer");
-  const writeScope = roleLabel === "verifier" && requestedScope === undefined && !tools.includes("fs_patch")
+  const writeScope = normalizedRole === "verifier" && requestedScope === undefined && !tools.includes("fs_patch")
     ? []
     : requestedScope;
   return { tools, sessionRole, roleLabel: effectiveLabel, writeScope };
@@ -193,16 +215,41 @@ function signalGroup(pgid: number, signal: NodeJS.Signals): void {
   }
 }
 
+function summarizeWorktreeGit(worktreePath: string): string {
+  try {
+    const status = execFileSync("git", ["-C", worktreePath, "status", "--short"], {
+      encoding: "utf8",
+      timeout: 2_000,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (!status) return `[worktree: ${worktreePath} | clean]`;
+    const changedCount = status.split(/\r?\n/).filter(Boolean).length;
+    const diffStat = execFileSync("git", ["-C", worktreePath, "diff", "--stat", "HEAD"], {
+      encoding: "utf8",
+      timeout: 2_000,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    const statTail = diffStat ? diffStat.split(/\r?\n/).pop()?.trim() ?? "" : "";
+    return `[worktree: ${worktreePath} | ${changedCount} file(s) touched${statTail ? ` (${statTail})` : ""}]`;
+  } catch {
+    return `[worktree: ${worktreePath}]`;
+  }
+}
+
 function buildRoleGuidance(record: SubagentRecord, worktreePath?: string): string {
   const lines = [
-    `Subagent Identity: agentId=${record.agentId}, taskPath=${record.taskPath}, parentId=${record.parentId}, role=${record.role}.`,
-    `Allowed Hydrogen MCP Tools: [${record.tools.join(", ")}].`,
+    `Subagent Identity: agentId=${record.agentId}, taskPath=${record.taskPath}, role=${record.role}, model=${record.model}.`,
+    `Authorized Hydrogen MCP Tools: [${record.tools.join(", ")}].`,
   ];
   if (worktreePath) {
-    lines.push(`ISOLATED GIT WORKTREE: cwd=${worktreePath}. Work inside this isolated git worktree directory.`);
+    lines.push(`ISOLATED GIT WORKTREE: cwd=${worktreePath}. Execute all edits and commands inside this isolated worktree.`);
   }
   if (record.writeScope !== undefined) {
-    lines.push(`STRICT WRITE SCOPE: writeScope=${JSON.stringify(record.writeScope)}. Never modify files outside this scope.`);
+    if (record.writeScope.length === 0) {
+      lines.push("STRICT READ-ONLY PROJECT SCOPE (writeScope=[]): Never modify repository files; temporary scratch files may only use /tmp.");
+    } else {
+      lines.push(`STRICT WRITE SCOPE: writeScope=${JSON.stringify(record.writeScope)}. Never modify files outside this scope.`);
+    }
   }
   return lines.join("\n");
 }
@@ -307,8 +354,10 @@ export class AgentManager {
 
   private snapshot(record: SubagentRecord): SubagentResult {
     const worktreePath = this.getWorktreePathByAgentId(record.agentId);
+    const effort = extractEffortFromModelId(record.model).effort;
     return {
       ...record,
+      ...(effort ? { effort } : {}),
       unreadMailCount: this.state.countUnreadMail(record.agentId),
       ...(worktreePath ? { worktreePath } : {}),
     };
@@ -463,10 +512,13 @@ export class AgentManager {
             taskName: task.taskName,
             role: task.role ?? input.role,
             model: task.model ?? input.model,
+            effort: task.effort ?? input.effort,
             tools: task.tools ?? input.tools,
             disableAgentMessage: task.disableAgentMessage ?? input.disableAgentMessage,
+            enableAgentMessage: task.enableAgentMessage ?? input.enableAgentMessage,
             writeScope: task.writeScope ?? input.writeScope,
             forkTurns: task.forkTurns ?? input.forkTurns,
+            includeParentContext: task.includeParentContext ?? input.includeParentContext,
             worktree: task.worktree ?? input.worktree,
             reuseKey: task.reuseKey,
             wake: input.wake,
@@ -494,6 +546,7 @@ export class AgentManager {
           nickname: r.nickname,
           role: r.role,
           model: r.model,
+          ...(r.effort ? { effort: r.effort } : {}),
           tools: r.tools,
           writeScope: r.writeScope,
           ...(r.worktreePath ? { worktreePath: r.worktreePath } : {}),
@@ -517,16 +570,30 @@ export class AgentManager {
 
   private buildInitialPrompt(identity: SessionIdentity, input: AgentDispatchInput): string {
     const parts: string[] = [];
-    if (input.forkTurns === "all") {
+    if (input.includeParentContext || input.forkTurns === "all") {
       const forkCard = this.getForkContext?.(identity.sessionId);
       if (forkCard?.trim()) {
-        parts.push(`[PARENT_FORK_CONTEXT]\n${forkCard.trim()}\n[/PARENT_FORK_CONTEXT]`);
+        parts.push(`[PARENT_CONTEXT_SUMMARY]\n${forkCard.trim()}\n[/PARENT_CONTEXT_SUMMARY]`);
       }
     }
     if (input.packet) parts.push(JSON.stringify(input.packet));
     if (input.prompt?.trim()) parts.push(input.prompt.trim());
     if (input.message?.trim()) parts.push(input.message.trim());
     return parts.join("\n\n");
+  }
+
+  private resolveSubagentModel(model?: string, effort?: string): string {
+    try {
+      return resolveModelAndEffort({
+        model,
+        effort,
+        parentModel: this.getParentModel?.(),
+        defaultModelName: LIMITS.DEFAULT_SUBAGENT_MODEL_NAME,
+        defaultEffort: LIMITS.DEFAULT_SUBAGENT_EFFORT,
+      }).modelId;
+    } catch (error) {
+      throw new HydrogenError("INVALID_INPUT", error instanceof Error ? error.message : String(error));
+    }
   }
 
   private async spawnSingle(
@@ -540,20 +607,21 @@ export class AgentManager {
     }
 
     const caller = this.callerContext(identity);
-    const model = input.model?.trim()
-      || (input.forkTurns === "all"
-        ? (this.getParentModel?.() || LIMITS.DEFAULT_SUBAGENT_MODEL)
-        : LIMITS.DEFAULT_SUBAGENT_MODEL);
+    const model = this.resolveSubagentModel(input.model, input.effort);
     const useWorktree = Boolean(input.worktree);
+    const wait = input.wait ?? true;
     const requestedScope = input.writeScope ?? input.packet?.writeScope;
     const { tools, sessionRole, roleLabel, writeScope } = resolveToolsAndRole(
       input.tools,
       input.role,
       requestedScope,
-      Boolean(input.disableAgentMessage),
-      useWorktree,
+      {
+        disableAgentMessage: Boolean(input.disableAgentMessage),
+        enableAgentMessage: Boolean(input.enableAgentMessage),
+        asyncMode: !wait,
+        forceWriter: useWorktree,
+      },
     );
-    const wait = input.wait ?? true;
 
     let entry = input.reuseKey
       ? [...this.entries.values()].find(candidate =>
@@ -696,7 +764,16 @@ export class AgentManager {
       await this.interrupt(entry.record.agentId);
     }
 
-    if (input.model?.trim()) entry.record.model = input.model.trim();
+    const wait = input.wait ?? true;
+    if (input.model?.trim() || input.effort?.trim()) {
+      const nextModel = this.resolveSubagentModel(input.model?.trim() || entry.record.model, input.effort);
+      if (nextModel !== entry.record.model) {
+        entry.record.model = nextModel;
+        if (entry.handle && this.adapter.setModel) {
+          await this.adapter.setModel(entry.handle, nextModel);
+        }
+      }
+    }
     const nextScope = input.writeScope !== undefined && entry.worktreePath
       ? [...new Set([...input.writeScope, entry.worktreePath])]
       : (input.writeScope ?? entry.record.writeScope);
@@ -705,8 +782,12 @@ export class AgentManager {
         input.tools,
         entry.record.role,
         nextScope,
-        Boolean(input.disableAgentMessage),
-        Boolean(entry.worktreePath),
+        {
+          disableAgentMessage: Boolean(input.disableAgentMessage),
+          enableAgentMessage: Boolean(input.enableAgentMessage),
+          asyncMode: !wait,
+          forceWriter: Boolean(entry.worktreePath),
+        },
       );
       entry.record.tools = tools;
       entry.record.writeScope = nextScope;
@@ -716,8 +797,6 @@ export class AgentManager {
       entry.record.writeScope = nextScope;
       this.persistPermissions(entry.identity.sessionId, entry.record.tools, nextScope);
     }
-
-    const wait = input.wait ?? true;
     entry.parentSessionId = identity.sessionId;
     entry.controller = new AbortController();
     entry.interruptMode = "none";
@@ -842,7 +921,7 @@ export class AgentManager {
         ...(opts.agentId ? { HYDROGEN_AGENT_ID: opts.agentId } : {}),
         ...(opts.taskPath ? { HYDROGEN_TASK_PATH: opts.taskPath } : {}),
       },
-      appendSystemPrompt: [openOptsBase.appendSystemPrompt, opts.roleGuidance].filter(Boolean).join("\n\n"),
+      appendSystemPrompt: openOptsBase.appendSystemPrompt,
     };
     return this.adapter.open(openOpts);
   }
@@ -878,8 +957,8 @@ export class AgentManager {
       signal.throwIfAborted();
 
       this.state.registerSession({ ...entry.identity, reuseKey: entry.record.reuseKey ?? undefined, status: "opening" });
+      let openedFreshHandle = false;
       if (!entry.handle) {
-        const roleGuidance = buildRoleGuidance(entry.record, entry.worktreePath);
         entry.handle = await this.openSubagent(entry.identity, {
           model: entry.record.model,
           allowedTools: entry.record.tools,
@@ -889,8 +968,8 @@ export class AgentManager {
           taskPath: entry.record.taskPath,
           role: entry.record.role,
           writeScope: entry.record.writeScope,
-          roleGuidance,
         });
+        openedFreshHandle = entry.handle.resumed !== true;
       }
       signal.throwIfAborted();
 
@@ -906,11 +985,14 @@ export class AgentManager {
       this.save(entry);
 
       const mails = this.state.drainMail({ recipientId: entry.record.agentId, rootId: entry.record.rootId });
+      const contractHeader = entry.record.turnCount === 1 || openedFreshHandle
+        ? `[SUBAGENT_CONTRACT]\n${buildRoleGuidance(entry.record, entry.worktreePath)}\n[/SUBAGENT_CONTRACT]`
+        : "";
       const resumeContext = wasColdResume && entry.handle.resumed !== true && previousSummary
         ? `[PREVIOUS_SUBAGENT_SUMMARY]\n${previousSummary}\n[/PREVIOUS_SUBAGENT_SUMMARY]`
         : "";
       const mailContext = mails.length > 0 ? formatMailboxNotification(mails) : "";
-      const fullPrompt = [resumeContext, mailContext, promptText.trim()].filter(Boolean).join("\n\n");
+      const fullPrompt = [contractHeader, resumeContext, mailContext, promptText.trim()].filter(Boolean).join("\n\n");
 
       signal.addEventListener("abort", onAbort, { once: true });
       let bytes = 0;
@@ -1303,7 +1385,7 @@ export class AgentManager {
       },
     );
     if (entry.worktreePath) {
-      const tag = `[worktree: ${entry.worktreePath}]`;
+      const tag = summarizeWorktreeGit(entry.worktreePath);
       const maxBodyChars = Math.max(0, LIMITS.AGENT_SUMMARY_CHARS - tag.length - 1);
       const body = text.slice(0, maxBodyChars).trimEnd();
       entry.record.summary = body ? `${body}\n${tag}` : tag;

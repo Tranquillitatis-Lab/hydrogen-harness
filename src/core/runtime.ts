@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AcpSessionAdapter } from "../adapters/acp.js";
 import type { ManagedSessionHandle, PromptTurnResult, SessionAdapter, SessionEvent, SessionOpenOptions, SessionUsage } from "../adapters/session.js";
-import { AgentManager, agyTurns, formatMailboxNotification, type SubagentOpenMeta } from "./agents.js";
+import { AgentManager, formatMailboxNotification, mainAgyTurns, type SubagentOpenMeta } from "./agents.js";
 import { fsRead, fsGlob, fsGrep, fsPatch } from "./files.js";
 import { HandoverManager } from "./handover.js";
 import { spillOutput, type OutputSpill } from "./output.js";
@@ -867,7 +867,7 @@ export class HydrogenRuntime {
       void cancelledClose.catch(error => emit({ type: "error", message: String(error) }));
     };
     try {
-      release = await agyTurns.acquire(signal);
+      release = await mainAgyTurns.acquire(signal);
       signal?.throwIfAborted();
       this.state.assertWriteLease(sessionId);
       this.state.setSessionStatus(sessionId, "running");

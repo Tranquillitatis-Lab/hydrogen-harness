@@ -152,6 +152,8 @@ export function formatToolResult(method: DaemonMethod, result: unknown): string 
         return result.map((item, idx) => {
           const t = item as {
             role?: string;
+            model?: string;
+            effort?: string;
             agentId?: string;
             taskPath?: string;
             nickname?: string;
@@ -163,10 +165,11 @@ export function formatToolResult(method: DaemonMethod, result: unknown): string 
             summary?: string;
             outputRef?: string | null;
           };
+          const modelStr = t.model ? ` | model: ${t.model}` : "";
           const toolsStr = t.tools?.length ? ` | tools: [${t.tools.join(",")}]` : "";
           const mailStr = t.unreadMailCount ? ` | mail: ${t.unreadMailCount}` : "";
           const wtStr = t.worktreePath ? ` | worktree: ${t.worktreePath}` : "";
-          return `### Subagent #${idx + 1} (${t.taskPath ?? t.agentId ?? ""} | ${t.nickname ?? t.role ?? ""} | ${t.status ?? ""} | turns: ${t.turnCount ?? 0}${toolsStr}${mailStr}${wtStr}${
+          return `### Subagent #${idx + 1} (${t.taskPath ?? t.agentId ?? ""} | ${t.role ?? t.nickname ?? ""}${modelStr} | ${t.status ?? ""} | turns: ${t.turnCount ?? 0}${toolsStr}${mailStr}${wtStr}${
             t.outputRef ? ` | shadow: ${t.outputRef}` : ""
           })\n${t.summary ?? ""}`;
         }).join("\n\n");
@@ -209,6 +212,7 @@ export function formatToolResult(method: DaemonMethod, result: unknown): string 
         taskPath?: string;
         nickname?: string;
         role?: string;
+        model?: string;
         tools?: string[];
         worktreePath?: string;
         status?: string;
@@ -219,7 +223,7 @@ export function formatToolResult(method: DaemonMethod, result: unknown): string 
       };
       if (Array.isArray(r.tasks)) {
         return r.tasks.map((t, idx) =>
-          `### Subagent #${idx + 1} (${t.taskPath ?? t.agentId ?? ""} | ${t.nickname ?? t.role ?? ""} | ${t.status ?? ""}${
+          `### Subagent #${idx + 1} (${t.taskPath ?? t.agentId ?? ""} | ${t.role ?? t.nickname ?? ""}${t.model ? ` | model: ${t.model}` : ""} | ${t.status ?? ""}${
             t.tools?.length ? ` | tools: [${t.tools.join(",")}]` : ""
           }${t.worktreePath ? ` | worktree: ${t.worktreePath}` : ""}${t.outputRef ? ` | shadow: ${t.outputRef}` : ""})\n${t.summary ?? ""}`,
         ).join("\n\n");
@@ -245,7 +249,8 @@ export function formatToolResult(method: DaemonMethod, result: unknown): string 
       const metaParts = [
         `agent: ${r.agentId ?? ""}`,
         r.taskPath ? `path: ${r.taskPath}` : "",
-        r.nickname ? `nickname: ${r.nickname}` : "",
+        r.role ? `role: ${r.role}` : "",
+        r.model ? `model: ${r.model}` : "",
         `status: ${r.status ?? ""}`,
         r.turnCount !== undefined ? `turns: ${r.turnCount}` : "",
         r.unreadMailCount ? `mail: ${r.unreadMailCount}` : "",
@@ -406,30 +411,34 @@ export function createMcpServer(
   }
 
   if (canRegister("agent_dispatch")) {
+    const subagentRoleEnum = z.enum(["explorer", "worker", "verifier"]);
+    const effortEnum = z.enum(["low", "medium", "high", "xhigh", "max"]);
     server.registerTool("agent_dispatch", {
-      description: "Orchestrate depth-1 subagents. Actions: spawn (default; single prompt or batch tasks:[...], custom tools[], writeScope, worktree, forkTurns='none'|'all', wait), followup (resume/send to agentId), send_message / broadcast, wait, interrupt, close, list.",
+      description: "Orchestrate depth-1 subagents (roles: explorer | worker | verifier; default model='hydrogen', effort='high'). Actions: spawn (default; single prompt or parallel tasks:[...], optional writeScope, worktree), followup (send next turn to agentId), wait, interrupt, close, list, send_message, broadcast.",
       inputSchema: z.object({
         action: z.enum([
-          "spawn", "dispatch", "followup", "send", "send_input", "resume",
+          "spawn", "followup",
+          "wait", "interrupt", "close", "list",
           "send_message", "broadcast",
-          "wait", "interrupt", "close", "list", "status",
         ]).optional(),
         agentId: z.string().optional(),
         to: z.union([z.string(), z.array(z.string())]).optional(),
         taskName: z.string().optional(),
-        role: z.string().optional(),
-        model: z.string().optional(),
+        role: subagentRoleEnum.optional(),
+        model: z.string().optional().describe("Model name or alias (default: 'hydrogen'; e.g. 'hydrogen', 'carbon', 'argon', 'flash', 'opus', 'sonnet', 'inherit', or full modelId)."),
+        effort: effortEnum.optional().describe("Thinking effort level (default: 'high'; low | medium | high | xhigh)."),
         tools: z.array(SUBAGENT_TOOL_ENUM).optional(),
         writeScope: z.array(z.string()).optional(),
-        forkTurns: z.enum(["none", "all"]).optional(),
+        includeParentContext: z.boolean().optional(),
         worktree: z.boolean().optional(),
         prompt: z.string().optional(),
         tasks: z.array(z.object({
           taskName: z.string().optional(),
-          role: z.string().optional(),
+          role: subagentRoleEnum.optional(),
           model: z.string().optional(),
+          effort: effortEnum.optional(),
           tools: z.array(SUBAGENT_TOOL_ENUM).optional(),
-          forkTurns: z.enum(["none", "all"]).optional(),
+          includeParentContext: z.boolean().optional(),
           worktree: z.boolean().optional(),
           writeScope: z.array(z.string()).optional(),
           prompt: z.string().optional(),

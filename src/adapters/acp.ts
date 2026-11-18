@@ -7,6 +7,7 @@ import { basename, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { detectMediaType } from "../core/files.js";
+import { extractEffortFromModelId, resolveModelAndEffort } from "../core/protocol.js";
 import type {
   ManagedSessionHandle, PromptTurnResult, SessionAdapter, SessionEvent,
   SessionOpenOptions, SessionUsage,
@@ -162,6 +163,29 @@ function object(value: unknown): ObjectValue {
   return value !== null && typeof value === "object" ? value as ObjectValue : {};
 }
 
+function selectAvailableModelId(requestedModel: string | undefined, modelsPayload: unknown): string | undefined {
+  if (!requestedModel?.trim()) return undefined;
+  const resolved = resolveModelAndEffort({ model: requestedModel }).modelId;
+  const modelsObj = object(modelsPayload);
+  const availableList = Array.isArray(modelsObj.availableModels) ? modelsObj.availableModels : [];
+  const availableIds = new Set<string>(
+    availableList
+      .map(item => String(object(item).modelId ?? "").trim())
+      .filter(Boolean),
+  );
+  if (availableIds.size === 0) return resolved;
+  if (availableIds.has(resolved)) return resolved;
+  if (availableIds.has(requestedModel.trim())) return requestedModel.trim();
+
+  const { base } = extractEffortFromModelId(resolved);
+  for (const fallbackEffort of ["high", "medium", "low"] as const) {
+    const candidate = `${base}-${fallbackEffort}`;
+    if (availableIds.has(candidate)) return candidate;
+  }
+  if (availableIds.has(base)) return base;
+  return resolved;
+}
+
 function buildHostKey(opts: SessionOpenOptions): string {
   return JSON.stringify([
     resolve(opts.cwd),
@@ -266,10 +290,11 @@ export class AcpSessionAdapter implements SessionAdapter {
       host.activeSessions.add(handle.conversationId);
       host.sessionsByConversationId.set(handle.conversationId, session);
 
-      if (opts.model !== undefined && opts.model !== object(result.models).currentModelId) {
+      const targetModel = selectAvailableModelId(opts.model, result.models);
+      if (targetModel !== undefined && targetModel !== object(result.models).currentModelId) {
         await this.request(host, "session/set_model", {
           sessionId: handle.conversationId,
-          modelId: opts.model,
+          modelId: targetModel,
         });
       }
       return handle;
@@ -333,10 +358,11 @@ export class AcpSessionAdapter implements SessionAdapter {
       host.activeSessions.add(handle.conversationId);
       host.sessionsByConversationId.set(handle.conversationId, session);
 
-      if (opts.model !== undefined && opts.model !== object(result.models).currentModelId) {
+      const targetModel = selectAvailableModelId(opts.model, result.models);
+      if (targetModel !== undefined && targetModel !== object(result.models).currentModelId) {
         await this.request(host, "session/set_model", {
           sessionId: session.handle.conversationId,
-          modelId: opts.model,
+          modelId: targetModel,
         });
       }
       return session.handle;
@@ -431,9 +457,10 @@ export class AcpSessionAdapter implements SessionAdapter {
   async setModel(handle: ManagedSessionHandle, modelId: string): Promise<void> {
     const session = this.get(handle);
     if (session.turn || session.closing) throw new Error("ACP session is busy or closing");
+    const resolvedModelId = resolveModelAndEffort({ model: modelId }).modelId;
     await this.request(session.host, "session/set_model", {
       sessionId: session.handle.conversationId,
-      modelId,
+      modelId: resolvedModelId,
     });
   }
 

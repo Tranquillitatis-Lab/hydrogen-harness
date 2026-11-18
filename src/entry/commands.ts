@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { ApprovalMode } from "../core/protocol.js";
+import { resolveModelAndEffort, type ApprovalMode } from "../core/protocol.js";
 import type { HydrogenRuntime } from "../core/runtime.js";
 import type { SessionRecord } from "../core/state.js";
 
@@ -129,13 +129,12 @@ export function normalizeApprovalMode(raw: string): ApprovalMode | undefined {
 }
 
 export function applyEffortToModel(currentModel: string, effort: string): string | undefined {
-  const level = effort.trim().toLowerCase();
-  if (!["low", "medium", "high", "xhigh"].includes(level)) return undefined;
-  if (/-(low|medium|high|xhigh)$/i.test(currentModel)) {
-    return currentModel.replace(/-(low|medium|high|xhigh)$/i, `-${level}`);
+  try {
+    const resolved = resolveModelAndEffort({ model: currentModel, effort });
+    return resolved.modelId;
+  } catch {
+    return undefined;
   }
-  if (/^gemini-/i.test(currentModel)) return `${currentModel}-${level}`;
-  return undefined;
 }
 
 export function parseTokenCount(raw: string): number | undefined {

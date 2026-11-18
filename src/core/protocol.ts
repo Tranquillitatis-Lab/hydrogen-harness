@@ -125,10 +125,104 @@ export const DEFAULT_SUBAGENT_TOOLS: readonly SubagentToolName[] = [
   "fs_read",
   "fs_glob",
   "fs_grep",
-  "agent_message",
 ] as const;
 
-export type AgentRole = string;
+export type ThinkingEffort = "low" | "medium" | "high" | "xhigh" | "max";
+export type CanonicalEffort = "low" | "medium" | "high" | "xhigh";
+export type SubagentRole = "explorer" | "worker" | "verifier";
+export type AgentRole = SubagentRole | (string & {});
+
+const MODEL_FAMILY_ALIASES: Record<string, { base: string; maxEffort: CanonicalEffort | null }> = {
+  hydrogen: { base: "gemini-4-hydrogen", maxEffort: "xhigh" },
+  "gemini-4-hydrogen": { base: "gemini-4-hydrogen", maxEffort: "xhigh" },
+  carbon: { base: "gemini-4-carbon", maxEffort: "high" },
+  "gemini-4-carbon": { base: "gemini-4-carbon", maxEffort: "high" },
+  argon: { base: "gemini-4-argon", maxEffort: "high" },
+  "gemini-4-argon": { base: "gemini-4-argon", maxEffort: "high" },
+  flash: { base: "gemini-3.8-flash", maxEffort: "high" },
+  "gemini-3.8-flash": { base: "gemini-3.8-flash", maxEffort: "high" },
+  opus: { base: "claude-opus-5-5", maxEffort: "high" },
+  "claude-opus": { base: "claude-opus-5-5", maxEffort: "high" },
+  "claude-opus-5-5": { base: "claude-opus-5-5", maxEffort: "high" },
+  sonnet: { base: "claude-sonnet-5-5", maxEffort: "high" },
+  "claude-sonnet": { base: "claude-sonnet-5-5", maxEffort: "high" },
+  "claude-sonnet-5-5": { base: "claude-sonnet-5-5", maxEffort: "high" },
+  orchestrator: { base: "gemini-pro-orchestrator", maxEffort: null },
+  "orchestrator-carbon": { base: "gemini-pro-orchestrator", maxEffort: null },
+  "gemini-pro-orchestrator": { base: "gemini-pro-orchestrator", maxEffort: null },
+  "orchestrator-argon": { base: "gemini-pro-orchestrator-argon", maxEffort: null },
+  "gemini-pro-orchestrator-argon": { base: "gemini-pro-orchestrator-argon", maxEffort: null },
+  "gpt-oss": { base: "gpt-oss-120b-medium", maxEffort: null },
+  "gpt-oss-120b": { base: "gpt-oss-120b-medium", maxEffort: null },
+  "gpt-oss-120b-medium": { base: "gpt-oss-120b-medium", maxEffort: null },
+};
+
+export function normalizeThinkingEffort(raw?: string): CanonicalEffort | undefined {
+  if (!raw) return undefined;
+  const clean = raw.trim().toLowerCase();
+  if (clean === "max" || clean === "xhigh") return "xhigh";
+  if (clean === "low" || clean === "medium" || clean === "high") return clean;
+  return undefined;
+}
+
+export function extractEffortFromModelId(modelId: string): { base: string; effort?: CanonicalEffort } {
+  const match = /^(.+)-(low|medium|high|xhigh)$/i.exec(modelId.trim());
+  if (!match) return { base: modelId.trim() };
+  return { base: match[1], effort: match[2].toLowerCase() as CanonicalEffort };
+}
+
+export function resolveModelAndEffort(options?: {
+  model?: string;
+  effort?: string;
+  parentModel?: string;
+  defaultModelName?: string;
+  defaultEffort?: CanonicalEffort;
+}): { modelId: string; effort: CanonicalEffort } {
+  const defaultModelName = options?.defaultModelName ?? LIMITS.DEFAULT_SUBAGENT_MODEL_NAME;
+  const defaultEffort = options?.defaultEffort ?? LIMITS.DEFAULT_SUBAGENT_EFFORT;
+  const explicitEffort = normalizeThinkingEffort(options?.effort);
+  if (options?.effort !== undefined && options.effort.trim() !== "" && !explicitEffort) {
+    throw new Error(`Invalid thinking effort "${options.effort}" (expected low | medium | high | xhigh | max)`);
+  }
+
+  const rawModel = options?.model?.trim();
+  const baseInput = !rawModel
+    ? defaultModelName
+    : rawModel.toLowerCase() === "inherit"
+      ? (options?.parentModel?.trim() || LIMITS.DEFAULT_SUBAGENT_MODEL)
+      : rawModel;
+
+  const { base: strippedBase, effort: embeddedEffort } = extractEffortFromModelId(baseInput);
+  const desiredEffort: CanonicalEffort = explicitEffort ?? embeddedEffort ?? defaultEffort;
+
+  const exactAlias = MODEL_FAMILY_ALIASES[baseInput.toLowerCase()];
+  if (exactAlias && exactAlias.maxEffort === null) {
+    const fixedEffort = extractEffortFromModelId(exactAlias.base).effort ?? desiredEffort;
+    return { modelId: exactAlias.base, effort: fixedEffort };
+  }
+
+  const familyAlias = exactAlias ?? MODEL_FAMILY_ALIASES[strippedBase.toLowerCase()];
+  if (familyAlias) {
+    if (familyAlias.maxEffort === null) {
+      const fixedEffort = extractEffortFromModelId(familyAlias.base).effort ?? desiredEffort;
+      return { modelId: familyAlias.base, effort: fixedEffort };
+    }
+    const clampedEffort: CanonicalEffort =
+      desiredEffort === "xhigh" && familyAlias.maxEffort !== "xhigh"
+        ? familyAlias.maxEffort
+        : desiredEffort;
+    return { modelId: `${familyAlias.base}-${clampedEffort}`, effort: clampedEffort };
+  }
+
+  // Unknown or future model family: apply suffix if explicit effort or embedded effort exists, or if gemini/claude family.
+  if (embeddedEffort || explicitEffort) {
+    return { modelId: `${strippedBase}-${desiredEffort}`, effort: desiredEffort };
+  }
+  if (/^(gemini-|claude-)/i.test(strippedBase) && !/thinking$/i.test(strippedBase)) {
+    return { modelId: `${strippedBase}-${desiredEffort}`, effort: desiredEffort };
+  }
+  return { modelId: baseInput, effort: desiredEffort };
+}
 
 export interface ContextPacket {
   objective: string;
@@ -143,9 +237,12 @@ export interface AgentTaskSpec {
   taskName?: string;
   role?: AgentRole;
   model?: string;
+  effort?: ThinkingEffort;
   tools?: SubagentToolName[];
   disableAgentMessage?: boolean;
+  enableAgentMessage?: boolean;
   forkTurns?: "none" | "all";
+  includeParentContext?: boolean;
   worktree?: boolean;
   prompt?: string;
   objective?: string;
@@ -181,10 +278,13 @@ export interface AgentDispatchInput {
   taskName?: string;
   role?: AgentRole;
   model?: string;
+  effort?: ThinkingEffort;
   tools?: SubagentToolName[];
   disableAgentMessage?: boolean;
+  enableAgentMessage?: boolean;
   writeScope?: string[];
   forkTurns?: "none" | "all";
+  includeParentContext?: boolean;
   worktree?: boolean;
   reuseKey?: string;
   packet?: ContextPacket;
@@ -300,6 +400,8 @@ export const LIMITS = {
   PTY_RING_BUFFER_BYTES: 10 * 1024 * 1024,
   DEFAULT_YIELD_MS: 90_000,
   MAX_YIELD_MS: 150_000,
+  DEFAULT_SUBAGENT_MODEL_NAME: "hydrogen",
+  DEFAULT_SUBAGENT_EFFORT: "high" as const,
   DEFAULT_SUBAGENT_MODEL: "gemini-4-hydrogen-high",
   MAX_AGENT_DEPTH: 1,
   MAX_CONCURRENT_AGY_TURNS: 4,
