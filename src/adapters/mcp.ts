@@ -341,7 +341,7 @@ export function createMcpServer(
 
   if (canRegister("fs_read")) {
     server.registerTool("fs_read", {
-      description: "Read numbered lines (up to 500 lines by default) or media from any project or local file path.",
+      description: "Read numbered lines (up to 500 lines by default, returned intact) or multimodal media from any project or local absolute path, recording an observation snapshot for fs_patch.",
       inputSchema: z.object({
         path: z.string(),
         startLine: z.number().int().optional(),
@@ -363,7 +363,7 @@ export function createMcpServer(
 
   if (canRegister("fs_grep")) {
     server.registerTool("fs_grep", {
-      description: "Search files for a regex pattern; return matching files, content lines, or counts.",
+      description: "Search files for a regex pattern; return matching files, numbered content lines, or match counts.",
       inputSchema: z.object({
         pattern: z.string(),
         path: z.string().optional(),
@@ -377,7 +377,7 @@ export function createMcpServer(
 
   if (canRegister("fs_patch")) {
     server.registerTool("fs_patch", {
-      description: "Write (full overwrite or create), delete, or patch a file using exact or line-anchored text replacements.",
+      description: "Modify files in projectRoot or /tmp. op='patch' requires prior fs_read in this session; op='write' creates or overwrites a full file without prior read; op='create' creates a new file; op='delete' removes a file.",
       inputSchema: z.object({
         path: z.string(),
         op: z.enum(["patch", "create", "write", "delete"]),
@@ -396,7 +396,7 @@ export function createMcpServer(
 
   if (canRegister("bash")) {
     server.registerTool("bash", {
-      description: "Execute a shell command in a managed PTY (default action='exec', sync wait default 90s / max 150s, or background: true), send stdin, poll, or kill.",
+      description: "Execute a shell command in a managed PTY with standard toolchain PATH (default action='exec', sync wait default 90s / max 150s; set background: true for long jobs/daemons), send stdin, poll, or kill.",
       inputSchema: z.object({
         action: z.enum(["exec", "stdin", "poll", "kill"]).optional(),
         jobId: z.string().optional(),

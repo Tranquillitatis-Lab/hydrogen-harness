@@ -500,19 +500,25 @@ export class HydrogenRuntime {
     if (subagentMeta?.taskPath) {
       env.HYDROGEN_TASK_PATH = subagentMeta.taskPath;
     }
-    const appendSystemPrompt = subagentMeta?.tools !== undefined
-      ? `你是 Hydrogen subagent（${subagentMeta.taskPath ?? subagentMeta.agentId ?? "subagent"}）：仅使用授权的 Hydrogen MCP 工具（${subagentMeta.tools.join("、")}）完成任务。`
-      : identity.role === "readonly"
-        ? "你是 Hydrogen readonly explorer：仅使用 fs_read、fs_glob、fs_grep 检索和阅读文件，完成后返回具体发现与关键路径行号。"
-        : "你是 Hydrogen writer：使用 8 个 Hydrogen MCP 原语（fs_read、fs_glob、fs_grep、fs_patch、bash、agent_dispatch、agent_message、todo_write）完成任务。独立调用可单步并行；上下文交接由 Spine Compact 引擎自动管理。";
+    const isSubagent = identity.depth > 0;
+    const subagentShellExists = existsSync(join(homedir(), ".gemini/config/agents/hgy-subagent.md"));
+    const targetAgent = isSubagent && this.agent === "hgy-shell" && subagentShellExists
+      ? "hgy-subagent"
+      : (this.agent || undefined);
+    // Keep appendSystemPrompt 100% static (undefined when using dedicated hgy-shell / hgy-subagent)
+    // so agy SystemPromptCache and cloud Prefix Cache hit across all sessions and subagents.
+    const appendSystemPrompt = targetAgent === "hgy-shell" || targetAgent === "hgy-subagent"
+      ? undefined
+      : isSubagent
+        ? "你是 Hydrogen 专职子 Agent：严格按首条消息 [SUBAGENT_CONTRACT] 授权的工具与范围执行，直接返回紧凑结论与文件路径行号。"
+        : "你是 Hydrogen 主控 Agent：仅使用 mcp_hydrogen_* 工具（独立调用单步并行），上下文压缩由 Live Compact 自动管理。";
     return {
-      cwd: subagentMeta?.cwd || this.projectRoot, model: modelOverride || this.model, agent: this.agent || undefined,
+      cwd: subagentMeta?.cwd || this.projectRoot, model: modelOverride || this.model, agent: targetAgent,
       resumeSessionId: subagentMeta?.resumeSessionId, env,
       autoApprovePermissions: this.approvalMode === "full-auto" || this.autoApproveOnNoUi,
       // Track B supplies its single shim through ACP; no second plugin/server is installed.
       mcpServers: { hydrogen: { command: process.execPath,
         args: [fileURLToPath(new URL("../entry/runtime-daemon.js", import.meta.url)), "--mcp-shim"], env } },
-      // Keep appendSystemPrompt 100% static so agy SystemPromptCache hits across all turns/epochs.
       appendSystemPrompt,
     };
   }
