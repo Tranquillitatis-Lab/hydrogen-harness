@@ -501,6 +501,18 @@ export class AcpSessionAdapter implements SessionAdapter {
     }
   }
 
+  async closeAndFlushHost(handle: ManagedSessionHandle): Promise<void> {
+    const session = this.sessions.get(handle.sessionId);
+    const host = session?.host;
+    await this.close(handle);
+    if (host && host.activeSessions.size === 0 && host.pendingOpens === 0) {
+      if (this.hosts.get(host.hostKey) === host) {
+        this.hosts.delete(host.hostKey);
+      }
+      await this.terminateHost(host);
+    }
+  }
+
   private get(handle: ManagedSessionHandle): Session {
     const session = this.sessions.get(handle.sessionId);
     if (!session || handle.backend !== this.backend) throw new Error("Unknown ACP session");

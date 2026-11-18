@@ -3,11 +3,12 @@ import { closeSync, existsSync, fstatSync, openSync, readSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { AcpSessionAdapter } from "../adapters/acp.js";
+import { AcpSessionAdapter, HYDROGEN_APP_DATA_REL_DIR } from "../adapters/acp.js";
 import type { ManagedSessionHandle, PromptTurnResult, SessionAdapter, SessionEvent, SessionOpenOptions, SessionUsage } from "../adapters/session.js";
 import { AgentManager, formatMailboxNotification, mainAgyTurns, type SubagentOpenMeta } from "./agents.js";
 import { fsRead, fsGlob, fsGrep, fsPatch } from "./files.js";
 import { HandoverManager } from "./handover.js";
+import { canCompactConversationSqlite, compactConversationSqlite, type LiveCompactResult } from "./live-compact.js";
 import { spillOutput, type OutputSpill } from "./output.js";
 import { ToolPolicy } from "./policy.js";
 import { ProcessManager } from "./process.js";
@@ -63,7 +64,6 @@ export class HydrogenRuntime {
   private readonly approvedShellCalls = new Set<string>();
   private readonly compacting = new Set<string>();
   private readonly injectedNativeSessions = new Set<string>();
-  private readonly lastCompactedTokenSnapshot = new Map<string, number>();
   private readonly lastRawTranscriptTokens = new Map<string, number>();
   private readonly worktreePolicies = new Map<string, ToolPolicy>();
   private readonly spill: OutputSpill;
@@ -74,8 +74,10 @@ export class HydrogenRuntime {
   private lastTranscriptPath?: string;
   private lastUserInput?: string;
   private compactRequested = false;
+  private pendingNativeLiveCompact?: { sessionId: string; conversationId: string; beforeTokens: number };
   private agent: string;
   onNativeRotate?: (info: { sessionId: string; beforeTokens: number; epoch: number }) => void;
+  onNativeLiveCompactRequest?: (req: { sessionId: string; conversationId: string; beforeTokens: number }) => void;
 
   constructor(projectRoot: string, private model = "gemini-4-hydrogen-high",
     private readonly adapter: SessionAdapter = new AcpSessionAdapter(),
@@ -677,8 +679,6 @@ export class HydrogenRuntime {
       status: "idle",
     });
     this.state.setWriteLease(sessionId, packet.epoch);
-    const rawBase = this.lastRawTranscriptTokens.get(sessionId) ?? beforeTokens;
-    this.setNativeCompactedBase(sessionId, rawBase, existing?.conversationId ?? undefined);
     this.handover.resetSessionUsage(sessionId, 4000);
     this.state.appendEvent("handover.completed", sessionId, {
       oldId: sessionId,
@@ -722,35 +722,6 @@ export class HydrogenRuntime {
     };
   }
 
-  private nativeCompactBaseMetaKey(sessionId: string, conversationId?: string): string {
-    const convId = conversationId ?? this.state.getSession(sessionId)?.conversationId ?? undefined;
-    return `native_compact_base:${convId || sessionId}`;
-  }
-
-  private getNativeCompactedBase(sessionId: string, conversationId?: string): number | undefined {
-    const mem = this.lastCompactedTokenSnapshot.get(sessionId);
-    if (mem !== undefined) return mem;
-    const raw = this.state.getMeta(this.nativeCompactBaseMetaKey(sessionId, conversationId));
-    if (!raw) return undefined;
-    const parsed = Number(raw);
-    if (Number.isFinite(parsed) && parsed > 0) {
-      this.lastCompactedTokenSnapshot.set(sessionId, parsed);
-      return parsed;
-    }
-    return undefined;
-  }
-
-  private setNativeCompactedBase(sessionId: string, rawTokens: number, conversationId?: string): void {
-    if (!(rawTokens > 0)) return;
-    this.lastCompactedTokenSnapshot.set(sessionId, rawTokens);
-    this.state.setMeta(this.nativeCompactBaseMetaKey(sessionId, conversationId), String(rawTokens));
-  }
-
-  private clearNativeCompactedBase(sessionId: string, conversationId?: string): void {
-    this.lastCompactedTokenSnapshot.delete(sessionId);
-    this.state.setMeta(this.nativeCompactBaseMetaKey(sessionId, conversationId), "");
-  }
-
   private observeTranscriptUsage(sessionId: string, transcriptPath?: string, lastUserInput?: string, conversationId?: string): number | undefined {
     if (conversationId) {
       this.bindThreadSession(sessionId, conversationId);
@@ -773,7 +744,6 @@ export class HydrogenRuntime {
       const lines = buf.toString("utf8").split("\n").filter(line => line.trim().startsWith("{"));
       let totalInputTokens = 0;
       let outputTokens = 0;
-      let sawCheckpoint = false;
       const parsedTurns: Array<{ user: string; assistant: string }> = [];
       for (let i = 0; i < lines.length; i++) {
         try {
@@ -785,7 +755,6 @@ export class HydrogenRuntime {
             output_tokens?: number | null;
           };
           if (step.type === "CHECKPOINT") {
-            sawCheckpoint = true;
             totalInputTokens = 4000;
             outputTokens = 0;
             parsedTurns.length = 0;
@@ -811,18 +780,9 @@ export class HydrogenRuntime {
       }
       if (totalInputTokens > 0) {
         this.lastRawTranscriptTokens.set(sessionId, totalInputTokens);
-        let effectiveTokens = totalInputTokens;
-        const compactedSnapshot = this.getNativeCompactedBase(sessionId, conversationId);
-        if (compactedSnapshot !== undefined) {
-          if (sawCheckpoint || totalInputTokens < compactedSnapshot) {
-            this.clearNativeCompactedBase(sessionId, conversationId);
-          } else {
-            effectiveTokens = 4000 + Math.max(0, totalInputTokens - compactedSnapshot);
-          }
-        }
-        this.state.recordTurn(sessionId, effectiveTokens, 0, lastUserInput?.length ?? 0);
-        this.handover.observeUsage(sessionId, { inputTokens: effectiveTokens, outputTokens, cumulative: true });
-        return effectiveTokens;
+        this.state.recordTurn(sessionId, totalInputTokens, 0, lastUserInput?.length ?? 0);
+        this.handover.observeUsage(sessionId, { inputTokens: totalInputTokens, outputTokens, cumulative: true });
+        return totalInputTokens;
       }
       return undefined;
     } catch { /* Ignore transient transcript read errors. */ return undefined; }
@@ -932,14 +892,38 @@ export class HydrogenRuntime {
           }
           emit(event);
         }, signal);
-        usage = result.usage ?? usage;
-        if (usage) this.handover.observeUsage(sessionId, usage);
-        this.handover.recordTurnBoundary?.(sessionId, usage?.inputTokens);
         const convId = result.conversationId || managed.handle.conversationId;
         if (convId) {
           managed.handle.conversationId = convId;
           this.bindThreadSession(sessionId, convId);
         }
+        usage = result.usage ?? usage;
+        if (convId) {
+          const transcriptPath = join(
+            homedir(),
+            ".gemini",
+            HYDROGEN_APP_DATA_REL_DIR,
+            "brain",
+            convId,
+            ".system_generated",
+            "logs",
+            "transcript.jsonl",
+          );
+          const realTotalTokens = this.observeTranscriptUsage(sessionId, transcriptPath, undefined, convId);
+          if (realTotalTokens !== undefined && realTotalTokens > 0) {
+            usage = {
+              inputTokens: realTotalTokens,
+              outputTokens: usage?.outputTokens ?? 0,
+              cumulative: true,
+              ...(usage?.thinkingTokens !== undefined ? { thinkingTokens: usage.thinkingTokens } : {}),
+              ...(usage?.cacheReadTokens !== undefined ? { cacheReadTokens: usage.cacheReadTokens } : {}),
+              ...(usage?.contextWindow !== undefined ? { contextWindow: usage.contextWindow } : {}),
+            };
+            result.usage = usage;
+          }
+        }
+        if (usage) this.handover.observeUsage(sessionId, usage);
+        this.handover.recordTurnBoundary?.(sessionId, usage?.inputTokens);
         if (result.finalText) timeline.assistantText = result.finalText;
         timeline.aborted = result.aborted;
         return { ...result, hardRotation };
@@ -1058,6 +1042,132 @@ export class HydrogenRuntime {
     return (await this.compactMain()).newSessionId;
   }
 
+  consumePendingNativeLiveCompact(): { sessionId: string; conversationId: string; beforeTokens: number } | undefined {
+    const req = this.pendingNativeLiveCompact;
+    this.pendingNativeLiveCompact = undefined;
+    return req;
+  }
+
+  executeNativeLiveCompact(req: {
+    sessionId: string;
+    conversationId: string;
+    beforeTokens: number;
+    dbPath?: string;
+  }): LiveCompactResult {
+    const openJobs = this.state.listPtyJobs().filter(j => j.alive).map(j => ({ jobId: j.jobId, command: j.command }));
+    const res = compactConversationSqlite({
+      projectRoot: this.projectRoot,
+      conversationId: req.conversationId,
+      dbPath: req.dbPath,
+      reportedTotalTokens: req.beforeTokens,
+      minTokens: LIMITS.LIVE_COMPACT_ACP_MIN_TOKENS,
+      keepRounds: LIMITS.LIVE_COMPACT_KEEP_ROUNDS,
+      pointerTokens: LIMITS.LIVE_COMPACT_POINTER_TOKENS,
+      chunkMin: LIMITS.LIVE_COMPACT_CHUNK_MIN_TOKENS,
+      force: true,
+      openJobs,
+    });
+    if (res.compacted) {
+      this.handover.resetSessionUsage(req.sessionId, res.estimatedAfterTokens);
+      this.state.appendEvent("live_compact.completed", req.sessionId, {
+        conversationId: req.conversationId,
+        floorBefore: res.floorBefore,
+        floorAfter: res.floorAfter,
+        savedTokens: res.savedTokens,
+        shadowRef: res.shadowRef,
+        mode: "native_tui",
+      });
+      const thread = this.ensureThread();
+      this.state.upsertTimelineItem({
+        id: randomUUID(),
+        threadId: thread.threadId,
+        kind: "compact",
+        epoch: this.state.activeEpoch,
+        beforeTokens: res.estimatedBeforeTokens,
+        afterTokens: res.estimatedAfterTokens,
+        summary: res.summary,
+        createdAt: Date.now(),
+      });
+    }
+    return res;
+  }
+
+  async liveCompactMain(options?: {
+    force?: boolean;
+    minTokens?: number;
+    dbPath?: string;
+  }): Promise<LiveCompactResult | undefined> {
+    this.assertIdle();
+    const sessionId = this.state.writerSessionId;
+    if (!sessionId) return undefined;
+    const managed = this.managed.get(sessionId);
+    const convId = managed?.handle.conversationId?.trim();
+    if (!managed || !convId) return undefined;
+
+    const beforeStats = this.contextStats();
+    const openJobs = this.state.listPtyJobs().filter(j => j.alive).map(j => ({ jobId: j.jobId, command: j.command }));
+    const compactOpts = {
+      projectRoot: this.projectRoot,
+      conversationId: convId,
+      dbPath: options?.dbPath,
+      reportedTotalTokens: beforeStats.inputTokens,
+      minTokens: options?.minTokens ?? LIMITS.LIVE_COMPACT_ACP_MIN_TOKENS,
+      keepRounds: LIMITS.LIVE_COMPACT_KEEP_ROUNDS,
+      pointerTokens: LIMITS.LIVE_COMPACT_POINTER_TOKENS,
+      chunkMin: LIMITS.LIVE_COMPACT_CHUNK_MIN_TOKENS,
+      force: options?.force,
+      openJobs,
+    };
+
+    // Fast WAL read-only check so we never close a warm ACP handle when no cut is needed.
+    if (!canCompactConversationSqlite(compactOpts)) {
+      return undefined;
+    }
+
+    if (this.adapter.closeAndFlushHost) {
+      await this.adapter.closeAndFlushHost(managed.handle);
+    } else {
+      await this.adapter.close(managed.handle);
+    }
+    let cutResult: LiveCompactResult | undefined;
+    try {
+      cutResult = compactConversationSqlite(compactOpts);
+    } finally {
+      managed.handle = await this.adapter.open(
+        this.sessionOptions(managed.identity, undefined, undefined, { resumeSessionId: convId }),
+      );
+      this.state.registerSession({
+        ...managed.identity,
+        conversationId: managed.handle.conversationId || convId,
+        status: "idle",
+      });
+    }
+
+    if (cutResult?.compacted) {
+      this.handover.resetSessionUsage(sessionId, cutResult.estimatedAfterTokens);
+      this.saveThreadCheckpoint();
+      this.state.appendEvent("live_compact.completed", sessionId, {
+        conversationId: convId,
+        floorBefore: cutResult.floorBefore,
+        floorAfter: cutResult.floorAfter,
+        savedTokens: cutResult.savedTokens,
+        shadowRef: cutResult.shadowRef,
+        mode: "acp",
+      });
+      this.state.upsertTimelineItem({
+        id: randomUUID(),
+        threadId: this.activeThreadId,
+        kind: "compact",
+        epoch: this.state.activeEpoch,
+        beforeTokens: cutResult.estimatedBeforeTokens,
+        afterTokens: cutResult.estimatedAfterTokens,
+        summary: cutResult.summary,
+        createdAt: Date.now(),
+      });
+    }
+    return cutResult;
+  }
+
   async compactMain(instructions?: string): Promise<{
     oldSessionId: string; newSessionId: string; epoch: number; beforeTokens: number; summary: string;
   }> {
@@ -1065,6 +1175,25 @@ export class HydrogenRuntime {
     const oldId = this.state.writerSessionId;
     if (!oldId) throw new HydrogenError("NO_WRITE_LEASE", "No main session");
     const beforeStats = this.contextStats();
+
+    // Prefer prefix-cache-friendly in-place SQLite Live Compact unless recovering from a hard API overflow.
+    if (instructions !== "reactive_overflow") {
+      const liveCut = await this.liveCompactMain({ force: true });
+      if (liveCut?.compacted && liveCut.estimatedAfterTokens < beforeStats.hardTokens) {
+        if (instructions?.trim()) {
+          this.handover.updateCheckpoint({ nextImmediateStep: instructions.trim() });
+          this.saveThreadCheckpoint();
+        }
+        return {
+          oldSessionId: oldId,
+          newSessionId: oldId,
+          epoch: this.state.activeEpoch,
+          beforeTokens: liveCut.estimatedBeforeTokens,
+          summary: liveCut.summary,
+        };
+      }
+    }
+
     let capturedPacket: HandoffPacket | undefined;
     const operation = (async () => {
       if (instructions?.trim()) {
@@ -1279,49 +1408,35 @@ export class HydrogenRuntime {
         if (session.depth === 0) {
           this.observeTranscriptUsage(sessionId, input.transcriptPath, input.lastUserInput, convId);
         }
-        if (session.depth === 0 && !this.managed.has(sessionId)) {
-          const stats = this.handover.stats(sessionId, this.model, this.autoCompact);
-          const shouldCompactNow = this.pendingNativeHandover
-            || this.consumeCompactRequest()
-            || (this.autoCompact && stats.level !== "none");
-          if (shouldCompactNow) {
-            const threadId = this.activeThreadId || this.state.getMeta("active_thread_id") || "";
-            let card: string;
-            if (this.pendingNativeHandover) {
-              const packet = this.pendingNativePacket ?? (this.pendingNativeSpineCard ? undefined : this.handover.packet({
-                sessionId,
-                transcriptPath: input.transcriptPath ?? this.lastTranscriptPath,
-                lastUserInput: input.lastUserInput ?? this.lastUserInput,
-              }));
-              card = this.pendingNativeSpineCard?.trim()
-                || packet?.spineCard?.trim()
-                || `Hydrogen Epoch=${this.state.activeEpoch} HandoffPacket（机械状态与已保存语义检查点，直接继续执行）：\n${JSON.stringify(packet)}`;
-              this.pendingNativeHandover = false;
-              this.pendingNativePacket = undefined;
-              this.pendingNativeSpineCard = undefined;
-              this.handover.resetSessionUsage(sessionId, 4000);
-            } else {
-              const rot = this.compactNativeInPlace(sessionId, input.transcriptPath, input.lastUserInput);
-              card = rot.card;
-              this.onNativeRotate?.({ sessionId, beforeTokens: rot.beforeTokens, epoch: rot.epoch });
-            }
-            if (threadId) {
-              this.state.setMeta(`pending_native_handover:${threadId}`, "");
-              this.state.setMeta(`pending_acp_handover:${threadId}`, "");
-            }
-            this.injectedNativeSessions.add(sessionId);
-            result.injectSteps = [
-              ...(result.injectSteps ?? []),
-              {
-                systemMessage: {
-                  systemMessage: card,
-                  metadata: {
-                    user_markdown: `⟳ **[hgy AutoCompact]** Epoch E${this.state.activeEpoch} 已生成并注入 Spine 检查点摘要`,
-                  },
+        if (session.depth === 0 && !this.managed.has(sessionId) && this.pendingNativeHandover) {
+          const threadId = this.activeThreadId || this.state.getMeta("active_thread_id") || "";
+          const packet = this.pendingNativePacket ?? (this.pendingNativeSpineCard ? undefined : this.handover.packet({
+            sessionId,
+            transcriptPath: input.transcriptPath ?? this.lastTranscriptPath,
+            lastUserInput: input.lastUserInput ?? this.lastUserInput,
+          }));
+          const card = this.pendingNativeSpineCard?.trim()
+            || packet?.spineCard?.trim()
+            || `Hydrogen Epoch=${this.state.activeEpoch} HandoffPacket（机械状态与已保存语义检查点，直接继续执行）：\n${JSON.stringify(packet)}`;
+          this.pendingNativeHandover = false;
+          this.pendingNativePacket = undefined;
+          this.pendingNativeSpineCard = undefined;
+          if (threadId) {
+            this.state.setMeta(`pending_native_handover:${threadId}`, "");
+            this.state.setMeta(`pending_acp_handover:${threadId}`, "");
+          }
+          this.injectedNativeSessions.add(sessionId);
+          result.injectSteps = [
+            ...(result.injectSteps ?? []),
+            {
+              systemMessage: {
+                systemMessage: card,
+                metadata: {
+                  user_markdown: `⟳ **[hgy Handover]** Epoch E${this.state.activeEpoch} 已注入跨线程交接摘要`,
                 },
               },
-            ];
-          }
+            },
+          ];
         }
         const mailbox = this.agents.drainMailboxForSession(sessionId, convId);
         if (mailbox.length > 0) {
@@ -1338,22 +1453,30 @@ export class HydrogenRuntime {
         if (session.depth === 0) {
           const currentInputTokens = this.observeTranscriptUsage(sessionId, input.transcriptPath, input.lastUserInput, convId);
           this.handover.recordTurnBoundary?.(sessionId, currentInputTokens);
-          if (!this.managed.has(sessionId)) {
+          if (!this.managed.has(sessionId) && convId) {
             const stats = this.handover.stats(sessionId, this.model, this.autoCompact);
-            if (this.consumeCompactRequest() || (this.autoCompact && stats.level !== "none")) {
-              const rot = this.compactNativeInPlace(sessionId, input.transcriptPath, input.lastUserInput);
-              this.pendingNativeHandover = true;
-              this.pendingNativePacket = rot.packet;
-              this.pendingNativeSpineCard = rot.card;
-              const threadId = this.activeThreadId || this.state.getMeta("active_thread_id") || "";
-              if (threadId) {
-                this.state.setMeta(`pending_native_handover:${threadId}`, JSON.stringify({
-                  sessionId,
-                  spineCard: rot.card,
-                  createdAt: Date.now(),
-                }));
-              }
-              this.onNativeRotate?.({ sessionId, beforeTokens: rot.beforeTokens, epoch: rot.epoch });
+            const manualRequested = this.consumeCompactRequest();
+            const overWatermark = this.autoCompact && (
+              stats.level !== "none" ||
+              (currentInputTokens ?? 0) >= this.handover.compactThreshold
+            );
+            if ((manualRequested || overWatermark) && canCompactConversationSqlite({
+              projectRoot: this.projectRoot,
+              conversationId: convId,
+              reportedTotalTokens: currentInputTokens ?? stats.inputTokens,
+              minTokens: LIMITS.LIVE_COMPACT_ACP_MIN_TOKENS,
+              keepRounds: LIMITS.LIVE_COMPACT_KEEP_ROUNDS,
+              pointerTokens: LIMITS.LIVE_COMPACT_POINTER_TOKENS,
+              chunkMin: LIMITS.LIVE_COMPACT_CHUNK_MIN_TOKENS,
+              force: true,
+            })) {
+              const req = {
+                sessionId,
+                conversationId: convId,
+                beforeTokens: currentInputTokens ?? stats.inputTokens,
+              };
+              this.pendingNativeLiveCompact = req;
+              this.onNativeLiveCompactRequest?.(req);
             }
           }
         }
@@ -1482,6 +1605,11 @@ export async function runTurnWithHandover(
     if (requested || result.hardRotation || (runtime.autoCompact && runtime.contextStats().level !== "none")) {
       await runtime.compactMain();
       hooks.onRotation?.({ epoch: runtime.state.activeEpoch, reason: result.hardRotation ? "hard" : "post_turn" });
+    } else if (runtime.autoCompact) {
+      const liveCut = await runtime.liveCompactMain({ force: false });
+      if (liveCut?.compacted) {
+        hooks.onRotation?.({ epoch: runtime.state.activeEpoch, reason: "post_turn" });
+      }
     }
     if (!result.hardRotation || !result.aborted) return;
     next = `继续执行交接包中的 activeGoal 与 nextImmediateStep，完成用户请求：\n${text}`;

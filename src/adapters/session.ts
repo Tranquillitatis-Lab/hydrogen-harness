@@ -79,4 +79,5 @@ export interface SessionAdapter {
   setModel?(handle: ManagedSessionHandle, modelId: string): Promise<void>;
   cancel(handle: ManagedSessionHandle): Promise<void>;
   close(handle: ManagedSessionHandle): Promise<void>;
+  closeAndFlushHost?(handle: ManagedSessionHandle): Promise<void>;
 }

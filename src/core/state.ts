@@ -867,6 +867,7 @@ export class StateStore {
   }
 
   close(): void {
+    if (!this.db.isOpen) return;
     for (const listener of this.closeListeners) listener();
     this.listeners.clear();
     this.db.close();

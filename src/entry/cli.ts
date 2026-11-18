@@ -133,70 +133,108 @@ async function runNativeAgyTui(
     : runtime.openNativeMain();
   const stats = runtime.contextStats();
   process.stderr.write(
-    `${ANSI.cyan}╭─ [hgy]${ANSI.reset} ${ANSI.green}${runtime.currentModel}${ANSI.reset} · shell=${ANSI.yellow}${runtime.currentAgent}${ANSI.reset} · mode=${ANSI.blue}${runtime.approvalMode}${ANSI.reset} · epoch=E${runtime.state.activeEpoch} · compact=${formatTokenShort(stats.softTokens)} (auto=${runtime.autoCompact ? "on" : "off"})\n`,
+    `${ANSI.cyan}╭─ [hgy]${ANSI.reset} ${ANSI.green}${runtime.currentModel}${ANSI.reset} · shell=${ANSI.yellow}${runtime.currentAgent}${ANSI.reset} · mode=${ANSI.blue}${runtime.approvalMode}${ANSI.reset} · epoch=E${runtime.state.activeEpoch} · live-compact=${formatTokenShort(stats.softTokens)} (auto=${runtime.autoCompact ? "on" : "off"})\n`,
   );
 
-  const agyArgs: string[] = ["--app_data_dir", HYDROGEN_APP_DATA_REL_DIR];
-  if (runtime.currentAgent && runtime.currentAgent !== "default") {
-    agyArgs.push("--agent", runtime.currentAgent);
-  }
-  if (runtime.currentModel) {
-    agyArgs.push("--model", runtime.currentModel);
-  }
-  if (opts.effort) {
-    agyArgs.push("--effort", opts.effort);
-  }
-  agyArgs.push("--mode", toAgyMode(runtime.approvalMode));
-  if (opts.skipPermissions || runtime.approvalMode === "full-auto") {
-    agyArgs.push("--dangerously-skip-permissions");
-  }
-  for (const dir of opts.addDirs) {
-    agyArgs.push("--add-dir", dir);
-  }
-  if (opts.resumeConversationId) {
-    agyArgs.push("--conversation", explicitTarget?.conversationId ?? opts.resumeConversationId);
-  } else if (opts.continueRecent) {
-    agyArgs.push("--continue");
-  }
-  if (opts.initialPrompt) {
-    agyArgs.push("-i", opts.initialPrompt);
-  }
+  let nextConversationId = opts.resumeConversationId
+    ? (explicitTarget?.conversationId ?? opts.resumeConversationId)
+    : undefined;
+  let nextContinueRecent = !opts.resumeConversationId && opts.continueRecent;
+  let nextInitialPrompt = opts.initialPrompt;
 
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    JETSKI_APP_DATA_DIR: HYDROGEN_APP_DATA_REL_DIR,
-    HYDROGEN_ACTIVE: "1",
-    HYDROGEN_PROJECT_ROOT: runtime.projectRoot,
-    HYDROGEN_SOCKET_PATH: opts.socketPath,
-    HYDROGEN_DAEMON_ADDR: opts.socketPath,
-    HYDROGEN_SESSION_ID: sessionId,
-    HYDROGEN_ROLE: "writer",
-    HYDROGEN_EPOCH: String(runtime.state.activeEpoch),
-    HYDROGEN_DEPTH: "0",
-  };
+  for (;;) {
+    const agyArgs: string[] = ["--app_data_dir", HYDROGEN_APP_DATA_REL_DIR];
+    if (runtime.currentAgent && runtime.currentAgent !== "default") {
+      agyArgs.push("--agent", runtime.currentAgent);
+    }
+    if (runtime.currentModel) {
+      agyArgs.push("--model", runtime.currentModel);
+    }
+    if (opts.effort) {
+      agyArgs.push("--effort", opts.effort);
+    }
+    agyArgs.push("--mode", toAgyMode(runtime.approvalMode));
+    if (opts.skipPermissions || runtime.approvalMode === "full-auto") {
+      agyArgs.push("--dangerously-skip-permissions");
+    }
+    for (const dir of opts.addDirs) {
+      agyArgs.push("--add-dir", dir);
+    }
+    if (nextConversationId) {
+      agyArgs.push("--conversation", nextConversationId);
+    } else if (nextContinueRecent) {
+      agyArgs.push("--continue");
+    }
+    if (nextInitialPrompt) {
+      agyArgs.push("-i", nextInitialPrompt);
+    }
 
-  const child = spawn("agy", agyArgs, {
-    cwd: runtime.projectRoot,
-    env,
-    stdio: "inherit",
-  });
-  if (child.pid) {
-    updateActiveDaemonMeta({
-      pid: process.pid,
-      tuiPid: child.pid,
-      socketPath: opts.socketPath,
-      projectRoot: runtime.projectRoot,
-      sessionId,
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      JETSKI_APP_DATA_DIR: HYDROGEN_APP_DATA_REL_DIR,
+      HYDROGEN_ACTIVE: "1",
+      HYDROGEN_PROJECT_ROOT: runtime.projectRoot,
+      HYDROGEN_SOCKET_PATH: opts.socketPath,
+      HYDROGEN_DAEMON_ADDR: opts.socketPath,
+      HYDROGEN_SESSION_ID: sessionId,
+      HYDROGEN_ROLE: "writer",
+      HYDROGEN_EPOCH: String(runtime.state.activeEpoch),
+      HYDROGEN_DEPTH: "0",
+    };
+
+    const child = spawn("agy", agyArgs, {
+      cwd: runtime.projectRoot,
+      env,
+      stdio: "inherit",
     });
-  }
+    if (child.pid) {
+      updateActiveDaemonMeta({
+        pid: process.pid,
+        tuiPid: child.pid,
+        socketPath: opts.socketPath,
+        projectRoot: runtime.projectRoot,
+        sessionId,
+      });
+    }
 
-  try {
-    await new Promise<void>((resolveChild, rejectChild) => {
-      child.once("error", rejectChild);
-      child.once("close", () => resolveChild());
-    });
-  } finally {
-    if (child.pid) removeTuiDaemonMeta(child.pid);
+    runtime.onNativeLiveCompactRequest = () => {
+      // Allow Stop hook IPC response to flush cleanly before asking agy TUI to close DB and exit.
+      const timer = setTimeout(() => {
+        try { child.kill("SIGTERM"); } catch { /* Ignore if already exited. */ }
+      }, 180);
+      timer.unref?.();
+    };
+
+    try {
+      await new Promise<void>((resolveChild, rejectChild) => {
+        child.once("error", rejectChild);
+        child.once("close", () => resolveChild());
+      });
+    } finally {
+      runtime.onNativeLiveCompactRequest = undefined;
+      if (child.pid) removeTuiDaemonMeta(child.pid);
+    }
+
+    const pendingCut = runtime.consumePendingNativeLiveCompact();
+    if (!pendingCut || opts.signal.aborted) {
+      break;
+    }
+
+    try {
+      const cutRes = runtime.executeNativeLiveCompact(pendingCut);
+      if (!cutRes.compacted) break;
+      process.stderr.write(
+        `\n${ANSI.magenta}⟳ [hgy Live Compact] ${formatTokenShort(cutRes.estimatedBeforeTokens)} -> ${formatTokenShort(cutRes.estimatedAfterTokens)} (保前缀 floor=#${cutRes.floorAfter}, 归档 ${cutRes.compactedStepCount} 个工具输出) · 无缝续接会话...${ANSI.reset}\n`,
+      );
+      nextConversationId = pendingCut.conversationId;
+      nextContinueRecent = false;
+      nextInitialPrompt = undefined;
+    } catch (error) {
+      process.stderr.write(
+        `\n${ANSI.yellow}⚠ [hgy Live Compact] 离线压缩跳过 (${error instanceof Error ? error.message : String(error)})${ANSI.reset}\n`,
+      );
+      break;
+    }
   }
 }
 

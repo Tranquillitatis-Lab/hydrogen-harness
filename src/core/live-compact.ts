@@ -7,7 +7,6 @@ import { HYDROGEN_APP_DATA_REL_DIR } from "../adapters/acp.js";
 import { saveShadowBlob } from "./output.js";
 
 export const SPINE_COMPACT_MARKER = "[SPINE_CHECKPOINT_CARD v1";
-const LEGACY_SPINE_MARKER = "[SPINE_CHECKPOINT_CARD]";
 
 const STEP_TYPE_USER_INPUT = 14;
 const STEP_TYPE_PLANNER_RESPONSE = 15;
@@ -197,7 +196,8 @@ export function resolveConversationDbPath(conversationId: string, customDir?: st
 }
 
 function isAlreadySpineCompacted(outputText: string): boolean {
-  return outputText.includes(SPINE_COMPACT_MARKER) || outputText.includes(LEGACY_SPINE_MARKER);
+  const { body } = splitAgyTimestampHeader(outputText);
+  return body.startsWith(`${SPINE_COMPACT_MARKER} | cut=`);
 }
 
 function parseStepRow(row: {
@@ -527,6 +527,84 @@ export function buildFinishedToolRounds(
     i = j;
   }
   return rounds;
+}
+
+export function canCompactConversationSqlite(options: LiveCompactOptions): boolean {
+  const dbPath = options.dbPath
+    ?? (options.conversationId ? resolveConversationDbPath(options.conversationId) : "");
+  if (!dbPath || !existsSync(dbPath)) return false;
+
+  const pointerTokens = options.pointerTokens ?? 24_000;
+  const keepRounds = Math.max(1, options.keepRounds ?? 3);
+  const minTokens = options.minTokens ?? 80_000;
+  const chunkMin = options.force ? 400 : (options.chunkMin ?? 24_000);
+
+  let db: DatabaseSync | undefined;
+  try {
+    db = new DatabaseSync(dbPath, { open: true, readOnly: true });
+    const rawRows = db.prepare(
+      "SELECT idx, step_type, status, step_payload FROM steps ORDER BY idx ASC",
+    ).all() as Array<{
+      idx: number;
+      step_type: number;
+      status: number;
+      step_payload: Uint8Array | null;
+    }>;
+    if (rawRows.length === 0) return false;
+    const steps = rawRows.map(parseStepRow);
+    let floorBefore = -1;
+    let lastNativeCheckpoint = -1;
+    for (const s of steps) {
+      if (s.isFloorMarker && s.idx > floorBefore) floorBefore = s.idx;
+      if (s.stepType === STEP_TYPE_CHECKPOINT && s.idx > lastNativeCheckpoint) lastNativeCheckpoint = s.idx;
+    }
+    const estimatedStepsTokens = steps
+      .filter(s => s.idx >= Math.max(0, lastNativeCheckpoint))
+      .reduce((acc, s) => acc + s.tokens, 4_500);
+    const effectiveTotalTokens = Math.max(estimatedStepsTokens, options.reportedTotalTokens ?? 0);
+
+    const allRounds = buildFinishedToolRounds(steps, pointerTokens);
+    const eligibleRounds = allRounds.filter(r => r.startIdx > floorBefore);
+    if (eligibleRounds.length === 0) return false;
+
+    const normalRounds = eligibleRounds.filter(r => !r.hasGiantTool);
+    const effectiveKeep = options.force && eligibleRounds.length <= keepRounds
+      ? Math.max(0, eligibleRounds.length - 1)
+      : keepRounds;
+    const keptTailNormalRounds = normalRounds.slice(-effectiveKeep);
+    const keepFloorPlannerIdx = keptTailNormalRounds.length > 0
+      ? keptTailNormalRounds[0].plannerIdx
+      : Number.POSITIVE_INFINITY;
+
+    let selectedRounds = eligibleRounds.filter(r => r.endIdx < keepFloorPlannerIdx);
+    let usedGiantTailCut = false;
+    const latestGiantRound = [...eligibleRounds].reverse().find(r => r.hasGiantTool);
+    if (latestGiantRound && (selectedRounds.length === 0 || latestGiantRound.endIdx > selectedRounds[selectedRounds.length - 1].endIdx)) {
+      selectedRounds = eligibleRounds.filter(r => r.endIdx <= latestGiantRound.endIdx);
+      usedGiantTailCut = true;
+    }
+    if (!options.force && !usedGiantTailCut && effectiveTotalTokens < minTokens) return false;
+    if (selectedRounds.length === 0) return false;
+
+    let spanToolTokens = 0;
+    let shrinkableSteps = 0;
+    for (const r of selectedRounds) {
+      for (const arrIdx of r.toolStepIndices) {
+        const s = steps[arrIdx];
+        if (s.idx > floorBefore) {
+          spanToolTokens += s.tokens;
+          if (s.tokens > 220 || s.hasMedia) shrinkableSteps += 1;
+        }
+      }
+    }
+    if (shrinkableSteps === 0) return false;
+    if (!options.force && !usedGiantTailCut && spanToolTokens < chunkMin) return false;
+    return true;
+  } catch {
+    return false;
+  } finally {
+    try { db?.close(); } catch { /* Ignore close error. */ }
+  }
 }
 
 export function compactConversationSqlite(options: LiveCompactOptions): LiveCompactResult {
